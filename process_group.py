@@ -43,7 +43,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import _store_based_barrier
 
-from quic_dist.tensor import deserialize_tensor, serialize_tensor
+from quic_dist.tensor import deserialize_tensor, serialize_tensor, wire_size
 from quic_dist.work import submit_as_work
 
 def _load_rust_quic_engine():
@@ -117,6 +117,38 @@ _DEFAULT_IDLE_TIMEOUT_S = 45.0
 _DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024 * 1024
 _NO_TIMEOUT_MS = 2**31 - 1
 _DRAIN_TIMEOUT_MS = 3000
+# Parallel-stream send/recv (see ProcessGroupQUIC._use_parallel_streams/
+# _chunk_plan) - OFF BY DEFAULT (threshold effectively unreachable) after
+# a real, unresolved stall found via direct testing - NOT purely a real-
+# RTT/cross-machine artifact, confirmed to occur on loopback too given
+# enough cumulative data: on the real cross-machine link (local <->
+# akun7, 65ms RTT), batching aggregate in-flight bytes per BATCH to a
+# small, proven-safe 2MiB (2 streams * 1MiB chunks) was NOT sufficient -
+# a second, immediately-following 2MB message (a separate dist.send()
+# call, own tag, itself also parallel-stream) returned "done" in under
+# 10ms, too fast to be a genuine ~2MB/65ms-RTT transfer (quinn-proto
+# accepted it into an internal buffer without it actually being on the
+# wire yet), and a THIRD 2MB message then hung completely - zero
+# connection activity until the 45s idle_timeout killed it outright, not
+# merely slow. The SAME pattern reproduced on loopback (~0ms RTT) with a
+# single larger transfer (10MB in one parallel-stream send, after an
+# earlier small warmup send on the same connection): CUMULATIVE
+# unflushed demand across separate calls stalls a connection regardless
+# of real network RTT, so this is a flow-control-accounting bug in the
+# multiplexed driver, not an RTT-pacing issue - bounding one call's
+# aggregate size does not bound the connection's total unflushed demand
+# over its lifetime. Needs real qlog-level tracing of quinn-proto's
+# write/ACK interaction to properly root-cause (see the deliverable
+# report's "recommended next steps") before it's safe to enable by
+# default. Correctness IS verified for isolated small-to-medium transfers
+# (see test_parallel_stream.py) and the code path is otherwise complete,
+# so it's left in place as an explicit opt-in via
+# QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES for anyone who wants to
+# experiment further, not deleted - just don't rely on it under
+# sustained/repeated large-tensor traffic until this is root-caused.
+_PARALLEL_STREAM_THRESHOLD_BYTES = int(os.environ.get("QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES", 2**62))
+_NUM_PARALLEL_STREAMS = int(os.environ.get("QUIC_DIST_NUM_PARALLEL_STREAMS", 2))
+_PARALLEL_CHUNK_BYTES = int(os.environ.get("QUIC_DIST_PARALLEL_CHUNK_BYTES", 1024 * 1024))
 
 
 class _PeerConnection:
@@ -293,6 +325,28 @@ class ProcessGroupQUIC(dist.ProcessGroup):
             except OSError:
                 window = _FALLBACK_WINDOW_BYTES
             stream_window = 6 * window
+            # receive_window/send_window (pure QUIC flow-control accounting -
+            # how much TOTAL unacked data may be outstanding across every
+            # stream combined) must be large enough for _NUM_PARALLEL_STREAMS
+            # streams to each get their full stream_window at once - a real
+            # bug found via direct testing: at the old fixed 8x, 3
+            # concurrent 6x-window streams already exhausted the connection
+            # budget, so a 4th stream got zero authorized window and hung
+            # until its own timeout (confirmed via a minimal repro: chunks
+            # 0-2 of a 4-way parallel-stream send completed, chunk 3 never
+            # got anywhere). max_congestion_window is DELIBERATELY NOT
+            # scaled the same way - it's a different mechanism (see
+            # rust/src/quic_engine/src/congestion.rs's BoundedController
+            # module docstring): the real, tested protection against
+            # bursting past the tiny actual OS socket buffer, independent
+            # of how much flow-control window authorizes. Raising it
+            # alongside flow control would reintroduce exactly the
+            # self-induced-loss stall that cap exists to prevent; leaving
+            # it at the already-proven-safe 8x while only raising the flow-
+            # control ceiling is what makes N-stream parallelism additive
+            # instead of another blind step along the same failure mode
+            # &sect;7's binary search already mapped out for a single stream.
+            flow_window = max(8 * window, _NUM_PARALLEL_STREAMS * stream_window)
             idle_timeout_ms = max(1, int(_DEFAULT_IDLE_TIMEOUT_S * 1000))
             handshake_timeout_ms = max(1, int(self._timeout.total_seconds() * 1000))
 
@@ -300,12 +354,12 @@ class ProcessGroupQUIC(dist.ProcessGroup):
                 if is_client:
                     driver = _qe.PyMultiplexedConnectionDriver.connect_client(
                         sock.fileno(), coordinator_peer_addr[0], coordinator_peer_addr[1],
-                        "quic-dist-v1", idle_timeout_ms, 8 * window, 8 * window, stream_window,
+                        "quic-dist-v1", idle_timeout_ms, flow_window, flow_window, stream_window,
                         8 * window, _DEFAULT_MAX_MESSAGE_BYTES, handshake_timeout_ms,
                     )
                 else:
                     driver = _qe.PyMultiplexedConnectionDriver.connect_server(
-                        sock.fileno(), idle_timeout_ms, 8 * window, 8 * window, stream_window,
+                        sock.fileno(), idle_timeout_ms, flow_window, flow_window, stream_window,
                         8 * window, _DEFAULT_MAX_MESSAGE_BYTES, handshake_timeout_ms,
                     )
             except ValueError as exc:
@@ -326,14 +380,110 @@ class ProcessGroupQUIC(dist.ProcessGroup):
 
     # ---- point-to-point ----
 
+    def _use_parallel_streams(self, tensor: torch.Tensor) -> bool:
+        """Whether a tensor is large enough for parallel-stream chunking
+        to be worth it at all (see `_chunk_plan` for the actual chunk
+        layout). Below `_PARALLEL_STREAM_THRESHOLD_BYTES`, parallel
+        streams add pure overhead (thread spawns, extra stream framing)
+        for no benefit - single-stream stays faster for small pipeline
+        activations."""
+        return wire_size(tensor) >= _PARALLEL_STREAM_THRESHOLD_BYTES
+
+    @staticmethod
+    def _chunk_plan(total_size: int) -> list[tuple[int, int]]:
+        """Byte-range chunk boundaries for a parallel-stream transfer,
+        batched in groups of `_NUM_PARALLEL_STREAMS` chunks of at most
+        `_PARALLEL_CHUNK_BYTES` each - sent/received one batch at a time,
+        not all chunks at once.
+
+        Bounding AGGREGATE in-flight bytes (batch_width * chunk_bytes)
+        is the real requirement here, found via direct cross-machine
+        testing, not assumed: QUIC's congestion window is per-CONNECTION
+        (shared across every stream on it), not per-stream, so opening
+        more concurrent streams does not raise the aggregate ceiling by
+        itself - it just competes for the same fixed budget. Confirmed
+        empirically on this project's real cross-machine link (65ms RTT):
+        2 or 4 concurrent streams both stalled completely at 10MB
+        aggregate, while the identical split succeeded at 5MB - the
+        breaking point tracked total in-flight bytes, not stream count.
+        Naively splitting a large tensor into N equal concurrent chunks
+        (an earlier version of this method) reliably reproduced that
+        stall on any tensor big enough to trigger parallel mode at all.
+        Batching keeps aggregate in-flight at `_NUM_PARALLEL_STREAMS *
+        _PARALLEL_CHUNK_BYTES`, comfortably inside the proven-safe range,
+        regardless of how large the whole tensor is - more chunks just
+        means more sequential batches, not a bigger burst."""
+        chunks = []
+        offset = 0
+        while offset < total_size:
+            end = min(offset + _PARALLEL_CHUNK_BYTES, total_size)
+            chunks.append((offset, end))
+            offset = end
+        return chunks
+
     def _send_one(self, tensor: torch.Tensor, dst: int, tag: int, msg_id: int) -> None:
         payload = serialize_tensor(tensor, message_id=msg_id, microbatch_id=tag, tensor_id=0)
         conn = self._get_or_connect(dst)
-        conn.send(str(tag), payload, self._timeout.total_seconds())
+        if not self._use_parallel_streams(tensor):
+            conn.send(str(tag), payload, self._timeout.total_seconds())
+            return
+
+        chunks = self._chunk_plan(len(payload))
+        for batch_start in range(0, len(chunks), _NUM_PARALLEL_STREAMS):
+            batch = chunks[batch_start : batch_start + _NUM_PARALLEL_STREAMS]
+            errors: list[Exception] = []
+
+            def _send_chunk(i: int, start: int, end: int) -> None:
+                try:
+                    conn.send(f"{tag}__ps{i}", payload[start:end], self._timeout.total_seconds())
+                except Exception as exc:  # noqa: BLE001 - surfaced via `errors`, not swallowed
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=_send_chunk, args=(batch_start + j, start, end))
+                for j, (start, end) in enumerate(batch)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if errors:
+                raise errors[0]
 
     def _recv_one(self, tensor: torch.Tensor, src: int, tag: int) -> None:
         conn = self._get_or_connect(src)
-        payload = conn.recv(str(tag), self._timeout.total_seconds())
+
+        if not self._use_parallel_streams(tensor):
+            payload = conn.recv(str(tag), self._timeout.total_seconds())
+        else:
+            # Chunk plan must exactly match the sender's - both derive it
+            # the same way, from `wire_size(tensor)`, which is why the
+            # pre-allocated `tensor` argument's shape/dtype must already
+            # match what the sender is sending (the same real ProcessGroup
+            # contract `_recv_one` already relies on for the single-stream
+            # path's shape/dtype validation below).
+            chunks = self._chunk_plan(wire_size(tensor))
+            results: list[bytes | None] = [None] * len(chunks)
+
+            for batch_start in range(0, len(chunks), _NUM_PARALLEL_STREAMS):
+                batch = chunks[batch_start : batch_start + _NUM_PARALLEL_STREAMS]
+                errors: list[Exception] = []
+
+                def _recv_chunk(i: int) -> None:
+                    try:
+                        results[i] = conn.recv(f"{tag}__ps{i}", self._timeout.total_seconds())
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=_recv_chunk, args=(batch_start + j,)) for j in range(len(batch))]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                if errors:
+                    raise errors[0]
+            payload = b"".join(results)
+
         received, meta = deserialize_tensor(payload)
         if tuple(received.shape) != tuple(tensor.shape) or received.dtype != tensor.dtype:
             raise RuntimeError(

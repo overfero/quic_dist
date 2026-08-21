@@ -59,6 +59,17 @@ class TensorMetadata:
     tensor_id: int
 
 
+def wire_size(tensor: torch.Tensor) -> int:
+    """Exact serialized byte size `serialize_tensor(tensor)` will produce,
+    computed from shape/dtype alone - lets a caller (parallel-stream
+    chunking in `process_group.py`) determine identical split points on
+    both the sender (from the real tensor) and the receiver (from its
+    pre-allocated output tensor of the same shape/dtype) without either
+    side needing to exchange a length up front. Must stay in exact sync
+    with `serialize_tensor`'s layout - not re-derived independently."""
+    return _HEADER_FIXED.size + tensor.dim() * 8 + tensor.numel() * tensor.element_size()
+
+
 def serialize_tensor(
     tensor: torch.Tensor,
     *,
