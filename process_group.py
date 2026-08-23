@@ -124,19 +124,43 @@ _DRAIN_TIMEOUT_MS = 3000
 # starts at quinn-proto's initial window (~12000 bytes) and does NOT grow
 # via slow start's expected exponential doubling - it grows LINEARLY, by
 # a small fixed increment (~2900 bytes) per step, with zero loss events
-# recorded (congestion_events=0) the whole time. That's congestion-
-# AVOIDANCE-style growth from the very first RTT, not slow start, for
-# reasons not yet understood (a fresh connection should slow-start until
-# a real loss or an explicit ssthresh, neither observed here). Reaching
-# enough window to cover a large message this way takes many round
-# trips; the SAME repro sometimes completes just inside a 30s window and
-# sometimes doesn't - genuinely timing/probabilistic, matching the
-# intermittent behavior observed throughout this investigation. Still
-# needs: confirming whether this is a quinn-proto NewReno quirk, a
-# BoundedController interaction (congestion.rs's wrapper - unlikely,
-# since window() only ever clamps DOWN, never explains slow linear
-# growth from a small start), or an ACK-timing issue specific to this
-# multiplexed driver's own loop. Correctness IS verified for isolated small-to-medium transfers
+# recorded (congestion_events=0) the whole time. Root cause narrowed
+# further via direct reading of quinn-proto 0.11.17's own source (not
+# guessed): `engine.rs::build_transport_config` configures
+# `CubicConfig`, not NewReno - the earlier "NewReno quirk" framing above
+# was wrong, corrected here. `Cubic::on_ack` (`congestion/cubic.rs`) has
+# a guard at its very top: `if app_limited || ... { return; }` - if
+# quinn-proto judged the connection "app-limited" at ACK time
+# (`connection/mod.rs`: `self.app_limited = buf.is_empty() &&
+# !congestion_blocked` inside `poll_transmit` - true whenever a poll
+# found nothing queued to send AND it wasn't cwnd-blocked), that ACK
+# contributes ZERO window growth, silently. This project's own driver
+# design (`multiplexed_driver.rs::drive_channel_send`) has a separate,
+# confirmed gap in the same area: it calls `done_tx.send(Ok(()))` (i.e.
+# reports the send complete to the Python caller) the moment
+# `write_stream()` has accepted every byte of the message into
+# quinn-proto's SEND buffer - flow control only, per `write_stream`'s
+# own documented semantics (see the module docstring above) - with no
+# check that those bytes have actually left the process, let alone been
+# ACKed. `close()`'s existing `_DRAIN_TIMEOUT_MS` (3000ms,
+# `process_group.py`) is the only place that waits for a real drain,
+# and only at teardown/reconnect. Put together, this reframes the
+# "cumulative demand" finding above more precisely: `send()`/`isend()`
+# returning is not proof the wire is clear, so a second large send hot
+# on the heels of the first (the literal shape of the original repro)
+# piles new backlog onto a connection whose prior backlog may still be
+# draining at whatever the true (still slow, still not fully explained)
+# growth rate turns out to be, and a 3s bound that's generous on
+# loopback can plausibly run out on a real link. The one part still
+# genuinely open: WHY growth is linear/slow rather than the fast
+# doubling Cubic's own slow-start branch (`self.window += bytes`,
+# unguarded by the `app_limited` check) should produce when nothing is
+# loss- or ssthresh-limited - i.e. whether `poll_transmit` in this
+# driver's own loop is intermittently leaving the "nothing queued"
+# state that trips `app_limited` even while a large message is still
+# mid-flight, is the next concrete thing to instrument (the existing
+# `debug_stats()`/`QUIC_DIST_RUST_DEBUG=1` tooling is enough to check
+# this - it just hasn't been checked yet). Correctness IS verified for isolated small-to-medium transfers
 # (see test_parallel_stream.py) and the code path is otherwise complete,
 # so it's left in place as an explicit opt-in via
 # QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES for anyone who wants to

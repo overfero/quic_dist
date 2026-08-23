@@ -11,12 +11,15 @@
 //! project's deployment machines cap `net.core.rmem_max`/`wmem_max` at
 //! 212992 bytes (208 KiB, confirmed via `sysctl` on both machines, see the
 //! `project_os_udp_buffer_ceiling` memory entry) and cannot raise it from
-//! inside the container. `NewReno` (the default controller) is free to grow
-//! its congestion window arbitrarily large for a sustained transfer -
-//! `quinn_proto::congestion::NewRenoConfig` exposes `initial_window` but no
-//! maximum-window cap (confirmed by reading `congestion/new_reno.rs`
-//! directly: `window` only ever grows on ACK, or resets to
-//! `minimum_window()` on loss - there is no ceiling field anywhere). Once
+//! inside the container. The configured controller (`CubicConfig` as of
+//! `engine.rs::build_transport_config` - this file originally reasoned
+//! about `NewReno`, since corrected; both share the same property below)
+//! is free to grow its congestion window arbitrarily large for a
+//! sustained transfer - neither `quinn_proto::congestion::NewRenoConfig`
+//! nor `CubicConfig` exposes a maximum-window cap (confirmed by reading
+//! `congestion/new_reno.rs` and `congestion/cubic.rs` directly: `window`
+//! only ever grows on ACK, or resets down on loss - there is no ceiling
+//! field in either). Once
 //! the window grows past what the OS socket buffers can actually hold for a
 //! large enough transfer, the connection bursts more data onto the wire
 //! than the kernel can buffer, causing self-induced packet loss at the

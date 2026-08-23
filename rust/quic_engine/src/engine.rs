@@ -328,17 +328,27 @@ impl Engine {
     /// docstring and the deliverable report's &sect;7): whether writes are
     /// genuinely blocked on congestion window, and what RTT/loss quinn-
     /// proto itself is observing, rather than guessing from the outside.
+    /// `udp_tx.{datagrams,bytes}` are cumulative counters, not
+    /// point-in-time - unlike `cwnd`, they only ever go up, so comparing two
+    /// calls to this method a tick apart directly answers "is data still
+    /// leaving the process at all" independent of whether `write_stream()`
+    /// is being called (see `multiplexed_driver.rs`'s TICK log and the
+    /// `process_group.py` module comment on the parallel-stream stall for
+    /// why that distinction matters: `write_stream()` returning does not
+    /// mean the bytes were transmitted).
     pub fn debug_stats(&self) -> Option<String> {
         let (_, connection) = self.connection.as_ref()?;
         let stats = connection.stats();
         Some(format!(
-            "cwnd={} rtt={:?} congestion_events={} lost_packets={} lost_bytes={} sent_packets={}",
+            "cwnd={} rtt={:?} congestion_events={} lost_packets={} lost_bytes={} sent_packets={} udp_tx_datagrams={} udp_tx_bytes={}",
             stats.path.cwnd,
             stats.path.rtt,
             stats.path.congestion_events,
             stats.path.lost_packets,
             stats.path.lost_bytes,
             stats.path.sent_packets,
+            stats.udp_tx.datagrams,
+            stats.udp_tx.bytes,
         ))
     }
 
