@@ -23,6 +23,16 @@ import torch
 import quic_dist
 import torch.distributed as dist
 
+if __import__("os").environ.get("QUIC_DIST_FAULTHANDLER"):
+    # py-spy needs ptrace, which this container's seccomp profile blocks
+    # outright (confirmed: `cap_sys_ptrace` denied, an active seccomp
+    # filter) - faulthandler dumps all thread stacks from IN-PROCESS via
+    # a plain signal, no ptrace needed, so it still works here.
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+
 rank = int(sys.argv[1])
 signaling_url = sys.argv[2]
 job_id = sys.argv[3] if len(sys.argv) > 3 else "n3_cross"

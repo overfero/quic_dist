@@ -162,9 +162,14 @@ def register(signaling_url: str, peer_id: str, udp_port: int, retries: int = 10,
 
 
 def wait_for_peer(signaling_url: str, self_id: str, peer_id: str, poll_interval: float = 1.0) -> dict:
+    import os
+
+    debug = os.environ.get("QUIC_DIST_PUNCH_DEBUG")
     while True:
         try:
             resp = requests.get(f"{signaling_url}/peer/{peer_id}", params={"self_id": self_id}, timeout=5)
+            if debug:
+                print(f"wait_for_peer: GET .../peer/{peer_id}?self_id={self_id} -> {resp.status_code} {resp.text}", flush=True)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("start_at") is not None:
