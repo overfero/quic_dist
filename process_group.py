@@ -196,6 +196,9 @@ class _PeerConnection:
     def close(self) -> None:
         self._driver.close(_DRAIN_TIMEOUT_MS)
 
+    def is_dead(self) -> bool:
+        return self._closed_exc is not None
+
 
 class ProcessGroupQUIC(dist.ProcessGroup):
     def __init__(
@@ -217,6 +220,8 @@ class ProcessGroupQUIC(dist.ProcessGroup):
         self._job_id = job_id
         self._peers: dict[int, _PeerConnection] = {}
         self._peers_lock = threading.Lock()
+        self._peer_connect_locks: dict[int, threading.Lock] = {}
+        self._peer_connect_locks_lock = threading.Lock()
         self._next_message_id = 0
         self._message_id_lock = threading.Lock()
 
@@ -225,15 +230,41 @@ class ProcessGroupQUIC(dist.ProcessGroup):
     def _self_id(self, rank: int) -> str:
         return f"quic_dist:{self._job_id}:rank{rank}"
 
+    def _connect_lock_for(self, peer_rank: int) -> threading.Lock:
+        with self._peer_connect_locks_lock:
+            lock = self._peer_connect_locks.get(peer_rank)
+            if lock is None:
+                lock = self._peer_connect_locks[peer_rank] = threading.Lock()
+            return lock
+
     def _get_or_connect(self, peer_rank: int) -> _PeerConnection:
+        """Also the auto-reconnect path: a connection whose dispatch
+        thread has observed the peer close (`is_dead()`) is dropped and
+        re-established here, transparently, on the caller's NEXT
+        send/recv - not via a background retry loop (simpler, and
+        correctness-preserving: a genuinely dead peer just keeps failing
+        each attempt rather than silently retrying forever in the
+        background). Serialized per-peer (not globally) via
+        `_connect_lock_for`, so a concurrent send/recv to a DIFFERENT,
+        healthy peer is never blocked waiting on this peer's reconnect -
+        only concurrent callers reconnecting to the SAME peer share one
+        real hole-punch+handshake attempt instead of racing several."""
         with self._peers_lock:
             conn = self._peers.get(peer_rank)
-            if conn is not None:
+            if conn is not None and not conn.is_dead():
                 return conn
-        conn = self._connect_to_peer(peer_rank)
-        with self._peers_lock:
-            self._peers[peer_rank] = conn
-        return conn
+
+        with self._connect_lock_for(peer_rank):
+            with self._peers_lock:
+                conn = self._peers.get(peer_rank)
+                if conn is not None and not conn.is_dead():
+                    return conn  # another thread already reconnected while we waited for the lock
+            if conn is not None:
+                conn.close()  # release the dead connection's Rust-side resources before replacing it
+            new_conn = self._connect_to_peer(peer_rank)
+            with self._peers_lock:
+                self._peers[peer_rank] = new_conn
+            return new_conn
 
     def _connect_to_peer(self, peer_rank: int) -> _PeerConnection:
         """Real hole-punch (unmodified `peer.py`) then a real QUIC
