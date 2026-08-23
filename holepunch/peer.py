@@ -485,9 +485,25 @@ async def barrier(protocol: PeerProtocol, marker: bytes, timeout: float = 60.0, 
 
 
 async def punch_loop(protocol: PeerProtocol, interval: float = 0.1) -> None:
+    """Runs as a bare `asyncio.create_task()` with nothing ever awaiting
+    its result - a real bug found via direct testing (a genuine
+    cross-machine, long-haul link, not loopback): a transient `OSError`
+    from a single `protocol.send()` call (plausible on any real lossy/
+    congested path) used to propagate straight out of this coroutine,
+    silently ending the task. The caller (`process_group.py`'s
+    `_connect_async`) only polls `protocol.established` and elapsed
+    time - it has no way to notice the task died, so it just keeps
+    waiting harmlessly for its own full timeout while this side has
+    silently stopped sending anything at all. Caught here instead so one
+    bad send can't end the whole punch attempt."""
     seq = 0
     while True:
-        protocol.send(pack_ping(seq, time.monotonic()))
+        if os.environ.get("QUIC_DIST_PUNCH_DEBUG") and seq % 20 == 0:
+            print(f"punch_loop: alive, seq={seq}, target={protocol.peer_addr}, established={protocol.established}", flush=True)
+        try:
+            protocol.send(pack_ping(seq, time.monotonic()))
+        except OSError as exc:
+            print(f"punch_loop: send failed (seq={seq}): {exc!r} - continuing", flush=True)
         seq += 1
         await asyncio.sleep(interval)
 
