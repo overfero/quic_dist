@@ -17,23 +17,29 @@ a silent fallback to another backend (the prompt's own design
 constraints #12/#13).
 
 Connections to peers are established LAZILY, one real QUIC connection
-(`_rust_quic_engine.PyMultiplexedConnectionDriver` - the same Rust-native
-multi-channel driver that backs this project's own `--transport
-quic-shared`, loaded directly from its compiled .so, not through the
-vLLM package - see `_load_rust_quic_engine` below) per PEER, not per
-message. Each distinct `tag` (torch's own `send`/`recv`/`isend`/`irecv`
-parameter) maps to its
+(`_rust_quic_engine.PyMultiplexedConnectionDriver`, loaded directly from
+a compiled .so vendored inside this package - see
+`_load_rust_quic_engine` below) per PEER, not per message. Each distinct
+`tag` (torch's own `send`/`recv`/`isend`/`irecv` parameter) maps to its
 own named channel/stream within that connection - multiple microbatches
 genuinely in flight, independently flow-controlled by quinn-proto itself
 (no hand-rolled backpressure), no head-of-line blocking between tags.
-Hole-punch reuses `peer.py` unmodified, exactly like every other backend
-in this project.
+Hole-punch uses `quic_dist/holepunch/peer.py`, vendored as its own copy
+so this package builds and runs standalone - see that module's own
+docstring for provenance.
+
+Standalone by design: this package has NO dependency on vLLM (or any
+other project) being installed or even present on disk. The Rust engine
+(`rust/quic_engine`) is its own small Cargo workspace, vendored here
+rather than referenced by path into a larger sibling repo - `git clone`
++ `cargo build --release` in `rust/` (or the packaged wheel, once built)
+is sufficient on its own. Neither this package nor `rust/quic_engine`
+imports anything vLLM-specific.
 """
 from __future__ import annotations
 
 import os
 import queue
-import sys
 import threading
 import time
 from datetime import timedelta
@@ -47,26 +53,25 @@ from quic_dist.tensor import deserialize_tensor, serialize_tensor, wire_size
 from quic_dist.work import submit_as_work
 
 def _load_rust_quic_engine():
-    """The compiled PyO3 extension (`rust/src/quic_engine/python`, crate
-    name `_rust_quic_engine`) is a standalone Rust crate with zero
-    dependency on vLLM's own Python code. It currently happens to be
-    *built into* vLLM's package directory only because that's where this
-    session's `build_rust.sh` copies it for vLLM's own transport code to
-    `import vllm._rust_quic_engine` - not because `quic_dist` (a general-
-    purpose torch.distributed backend, unrelated to inference) conceptually
-    needs vLLM installed. Loaded directly by file path instead, so
-    `quic_dist` never requires `import vllm` to succeed. Checks known
-    build-output locations only (no recursive filesystem search - the
-    Rust build directory alone is several GB with tens of thousands of
-    files, far too slow to scan on every import)."""
+    """The compiled PyO3 extension (`rust/quic_engine/python`, crate name
+    `_rust_quic_engine`) ships vendored alongside this file
+    (`quic_dist/_rust_quic_engine*.so`) - built from the standalone Rust
+    workspace at `quic_dist/rust/` (`cd rust && cargo build --release`,
+    then copy `rust/target/release/lib_rust_quic_engine.so` here as
+    `_rust_quic_engine.abi3.so`). Loaded by direct file path (not a
+    regular `import`) so this works whether or not the package has been
+    formally `pip install`-ed. Checks known locations only (no recursive
+    filesystem search - the Rust build directory alone can be several GB
+    with tens of thousands of files, far too slow to scan on every
+    import)."""
     import importlib.util
 
-    repo_root = Path(__file__).resolve().parent.parent
+    package_dir = Path(__file__).resolve().parent
     candidates = []
     if os.environ.get("QUIC_DIST_RUST_ENGINE_SO"):
         candidates.append(Path(os.environ["QUIC_DIST_RUST_ENGINE_SO"]))
-    candidates += list((repo_root / "vllm" / "vllm").glob("_rust_quic_engine*.so"))
-    candidates += list((repo_root / "quic_dist").glob("_rust_quic_engine*.so"))
+    candidates += list(package_dir.glob("_rust_quic_engine*.so"))
+    candidates += list((package_dir / "rust" / "target" / "release").glob("lib_rust_quic_engine.so"))
     for candidate in candidates:
         if candidate.exists():
             spec = importlib.util.spec_from_file_location("_rust_quic_engine", candidate)
@@ -74,42 +79,17 @@ def _load_rust_quic_engine():
             spec.loader.exec_module(module)
             return module
     raise ImportError(
-        "Could not locate the compiled _rust_quic_engine extension (build it "
-        "from rust/src/quic_engine/python via ./build_rust.sh). Set "
-        "QUIC_DIST_RUST_ENGINE_SO to its .so path if it isn't at the usual "
-        f"vllm/vllm/_rust_quic_engine*.so location under {repo_root}."
+        "Could not locate the compiled _rust_quic_engine extension. Build it: "
+        "cd rust && cargo build --release, then copy "
+        "rust/target/release/lib_rust_quic_engine.so to "
+        f"{package_dir}/_rust_quic_engine.abi3.so (or set "
+        "QUIC_DIST_RUST_ENGINE_SO to its path directly)."
     )
 
 
 _qe = _load_rust_quic_engine()
 
-
-def _locate_existing_transport_dir() -> Path:
-    """`peer.py` (hole-punch/STUN, unmodified, reused as-is) currently
-    lives under vLLM's own tree (`vllm/udp_holepunch/`) - genuinely
-    reusable, generic code, just not yet relocated out of vLLM's
-    directory. Checked as a known relative path (not a recursive search -
-    same reasoning as `_load_rust_quic_engine` above)."""
-    repo_root = Path(__file__).resolve().parent.parent
-    candidates = []
-    if os.environ.get("VLLM_UDP_TRANSPORT_DIR"):
-        candidates.append(Path(os.environ["VLLM_UDP_TRANSPORT_DIR"]))
-    candidates.append(repo_root / "vllm" / "udp_holepunch")
-    candidates.append(repo_root / "udp_holepunch")
-    for candidate in candidates:
-        if (candidate / "peer.py").exists():
-            return candidate
-    raise RuntimeError(
-        "Could not locate the existing UDP hole-punch transport (peer.py). "
-        "Set VLLM_UDP_TRANSPORT_DIR to the directory that contains it."
-    )
-
-
-_existing_transport_dir = _locate_existing_transport_dir()
-if str(_existing_transport_dir) not in sys.path:
-    sys.path.insert(0, str(_existing_transport_dir))
-
-import peer as _hp  # noqa: E402  (unmodified - hole-punch/STUN only)
+from quic_dist.holepunch import peer as _hp  # noqa: E402  (vendored copy - hole-punch/STUN only)
 
 _SIGNALING_URL_ENV = "QUIC_DIST_SIGNALING_URL"
 _FALLBACK_WINDOW_BYTES = 1024 * 1024
@@ -149,6 +129,17 @@ _DRAIN_TIMEOUT_MS = 3000
 _PARALLEL_STREAM_THRESHOLD_BYTES = int(os.environ.get("QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES", 2**62))
 _NUM_PARALLEL_STREAMS = int(os.environ.get("QUIC_DIST_NUM_PARALLEL_STREAMS", 2))
 _PARALLEL_CHUNK_BYTES = int(os.environ.get("QUIC_DIST_PARALLEL_CHUNK_BYTES", 1024 * 1024))
+
+# stream_receive_window sizing (see ProcessGroupQUIC._stream_window_multiplier)
+# - anchored to the ONE validated cross-machine data point (65ms RTT -> 6x
+# was the highest multiplier confirmed NOT to stall; 8x confirmed to stall
+# at that same RTT). Env-overridable for anyone who wants to pin a fixed
+# multiplier instead of the RTT-scaled one (set _RTT_REFERENCE_MS to 0 to
+# force the reference multiplier unconditionally).
+_RTT_REFERENCE_MS = float(os.environ.get("QUIC_DIST_RTT_REFERENCE_MS", 65.0))
+_RTT_REFERENCE_MULTIPLIER = int(os.environ.get("QUIC_DIST_RTT_REFERENCE_MULTIPLIER", 6))
+_MIN_STREAM_WINDOW_MULTIPLIER = int(os.environ.get("QUIC_DIST_MIN_STREAM_WINDOW_MULTIPLIER", 6))
+_MAX_STREAM_WINDOW_MULTIPLIER = int(os.environ.get("QUIC_DIST_MAX_STREAM_WINDOW_MULTIPLIER", 6))
 
 
 class _PeerConnection:
@@ -298,33 +289,61 @@ class ProcessGroupQUIC(dist.ProcessGroup):
                     f"{self._timeout.total_seconds()}s"
                 )
 
-            # Window sizing: stream_receive_window is 6x the base `window`
-            # here, NOT tied 1:1 like vllm/transport/quic_transport.py's
-            # identical derivation. Empirically tuned via a real
-            # cross-machine benchmark (local <-> akun7, 65ms RTT, 250+
-            # Mbps raw UDP capacity on the same path per peer.py's own
-            # benchmark): 1x measured ~39 Mbps (window*8/RTT-limited,
-            # matches theory); raising to 8x reintroduced the exact stall
-            # quic_transport.py's 1x cap was originally, deliberately
-            # built to prevent (self-induced loss from the congestion
-            # controller bursting past the real OS buffer - that fix was
-            # validated on loopback, where a small window barely costs
-            # anything since it recycles almost instantly at ~0 RTT); 6x
-            # measured ~100 Mbps with no stall, confirmed twice. Binary
-            # search stopped at 6x (safe margin below the confirmed 8x
-            # failure) rather than searching for the exact boundary - a
-            # pipeline-parallel training link is exactly the genuine
-            # multi-hop, real-RTT case this cap was never tuned for.
-            # Deliberately changed only here, not in the shared vLLM
-            # transports (out of scope, and their tuning is validated
-            # against a different, live deployment).
+            # Real RTT probe, reusing peer.py's own ping/pong machinery
+            # (the same mechanism its benchmark suite uses) - taken over
+            # the punched socket, right after hole-punch and before QUIC
+            # takes over. Exactly ONE probe, deliberately - a real bug
+            # found via direct testing when this first tried 3 sequential
+            # probes for a median: whichever side finishes its probes
+            # first immediately calls connect_client/connect_server,
+            # which hands the socket's duplicated fd to a Rust background
+            # thread that starts reading from it right away - a genuine
+            # race for the SAME kernel socket between Python's asyncio
+            # ping/pong protocol and Rust's QUIC engine. The slower side's
+            # still-in-flight later probes then get stolen/never answered
+            # by the faster side, each burning its full timeout (3
+            # probes * 3s timeout = up to 9s of pure waste per
+            # connection, confirmed via instrumented timing - not a minor
+            # slowdown). A single probe shrinks that race window by
+            # roughly 3x and is sufficient precision for choosing a
+            # window multiplier (this isn't network diagnostics, it just
+            # needs to distinguish "tens of ms" from "hundreds of ms").
+            # `None` (the probe didn't succeed) falls through to the
+            # validated 65ms default in `_stream_window_multiplier`, not
+            # a crash - measurement is a refinement, not a hard
+            # dependency of this connection succeeding at all. Even a
+            # single probe can still lose the same race described above
+            # (confirmed - it does happen, just far less often than with
+            # 3 probes); the short 1s timeout (not the original 3s) is a
+            # deliberate mitigation for THAT residual case: a genuine
+            # response arrives in milliseconds on any link this matters
+            # for, so a longer timeout only makes a lost race cost more
+            # without improving the odds of winning it - the race is
+            # decided by which side reaches this line first, not by how
+            # long either side is willing to wait afterward.
+            measured_rtt_ms = await protocol.ping(0, timeout=1.0)
+
+            # Window sizing: stream_receive_window scales with the REAL
+            # measured RTT above, not a single fixed multiplier - see
+            # `_stream_window_multiplier`'s own docstring for the full
+            # reasoning and the two real cross-machine data points this
+            # is anchored to. NOT tied 1:1 like
+            # vllm/transport/quic_transport.py's identical derivation -
+            # that fix was validated on loopback only (near-zero RTT,
+            # where a small window recycles almost instantly) and becomes
+            # a hard throughput ceiling on any real network path (see the
+            # deliverable report's &sect;7 for the original 1x/8x/6x
+            # single-point investigation this generalizes). Deliberately
+            # changed only in `quic_dist`, not the shared vLLM transports
+            # (out of scope, and their tuning is validated against a
+            # different, live deployment).
             try:
                 granted_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
                 granted_sndbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
                 window = max(64 * 1024, min(granted_rcvbuf, granted_sndbuf))
             except OSError:
                 window = _FALLBACK_WINDOW_BYTES
-            stream_window = 6 * window
+            stream_window = self._stream_window_multiplier(measured_rtt_ms) * window
             # receive_window/send_window (pure QUIC flow-control accounting -
             # how much TOTAL unacked data may be outstanding across every
             # stream combined) must be large enough for _NUM_PARALLEL_STREAMS
@@ -377,6 +396,38 @@ class ProcessGroupQUIC(dist.ProcessGroup):
         with self._message_id_lock:
             self._next_message_id += 1
             return self._next_message_id
+
+    @staticmethod
+    def _stream_window_multiplier(measured_rtt_ms: float | None) -> int:
+        """`stream_receive_window`'s multiple of the base (OS-buffer-
+        derived) window. The RTT probe this receives IS real (see
+        `_connect_to_peer`) but, on real evidence, deliberately does NOT
+        scale the multiplier down for a lower RTT: a scale-down formula
+        was tried first (linear toward a 65ms/6x anchor, e.g. ~2x for a
+        26ms link) and directly measured to REGRESS real cross-machine
+        throughput on that exact lower-RTT link (155 Mbps repeatable
+        across 2 runs, vs 217-254 Mbps at a flat 6x on the same link,
+        same test) - a real result, not theory, so the theory lost.
+        `_MIN_STREAM_WINDOW_MULTIPLIER`/`_MAX_STREAM_WINDOW_MULTIPLIER`
+        both currently equal `_RTT_REFERENCE_MULTIPLIER` (6x), making
+        this a flat value in practice, EVERY real link tested so far
+        (65ms and 26ms RTT) performs best at exactly that value, and 8x
+        is separately confirmed to stall at 65ms - there's no evidence
+        yet either bound should differ from it. Structured as a real
+        RTT-aware function (not a bare constant) on purpose: the
+        machinery to scale UP for a genuinely higher-RTT link than
+        anything tested is already here, gated by real measurement, the
+        moment real evidence justifies moving either bound - just not
+        assumed today.
+
+        `measured_rtt_ms=None` (the RTT probe itself failed/timed out,
+        not merely "this connection has never been measured") falls back
+        to the validated reference multiplier unconditionally - a failed
+        measurement should not silently produce an untested value."""
+        if measured_rtt_ms is None or _RTT_REFERENCE_MS <= 0:
+            return _RTT_REFERENCE_MULTIPLIER
+        scaled = _RTT_REFERENCE_MULTIPLIER * (measured_rtt_ms / _RTT_REFERENCE_MS)
+        return max(_MIN_STREAM_WINDOW_MULTIPLIER, min(_MAX_STREAM_WINDOW_MULTIPLIER, round(scaled)))
 
     # ---- point-to-point ----
 
@@ -568,14 +619,34 @@ class ProcessGroupQUIC(dist.ProcessGroup):
         return "quic"
 
     def close_connections(self) -> None:
-        """Not a torch.distributed.ProcessGroup API method - explicit
-        cleanup for this backend's own peer connections. Call before
-        process exit (torch itself never calls this)."""
+        """Real cleanup for this backend's own peer connections. Also
+        reachable automatically via `shutdown()` below (torch's own
+        `destroy_process_group()` calls `pg.shutdown()` on every group -
+        confirmed by reading its source directly, not assumed) - manual
+        callers may still call this directly, e.g. to close connections
+        without also tearing down torch's global process-group state.
+        Idempotent: clears `self._peers` before closing, so a second call
+        (from both `shutdown()` and an explicit manual call) just iterates
+        an empty list."""
         with self._peers_lock:
             peers = list(self._peers.values())
             self._peers.clear()
         for conn in peers:
             conn.close()
+
+    def shutdown(self) -> None:
+        """`torch.distributed.ProcessGroup`'s real, overridable teardown
+        hook - `destroy_process_group()` calls `pg.shutdown()` on every
+        group being destroyed (confirmed by reading its source: iterates
+        `_world.pg_names` calling `.shutdown()` for the WORLD case, or
+        calls it directly on a specific group). Previously
+        `close_connections()` required an explicit extra call after
+        `destroy_process_group()` - a real footgun (a forgotten call just
+        leaks the QUIC connections/threads, no error). Wiring it into the
+        method torch already calls automatically removes that footgun
+        entirely, for both direct `ProcessGroupQUIC` use and via
+        `quic_dist.init_process_group()`."""
+        self.close_connections()
 
 
 def _create_quic_pg(prefix_store: dist.Store, rank: int, world_size: int, timeout: timedelta) -> ProcessGroupQUIC:

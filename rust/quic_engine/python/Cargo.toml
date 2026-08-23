@@ -1,0 +1,18 @@
+[package]
+name = "vllm-quic-engine-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_rust_quic_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytes.workspace = true
+libc.workspace = true
+pyo3.workspace = true
+vllm-quic-engine.workspace = true
+
+[lints]
+workspace = true

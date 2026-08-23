@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quic_dist"
+version = "0.1.0"
+description = "A real torch.distributed ProcessGroup backend over QUIC, for pipeline-parallel training between NAT'd machines with no cloud VPC and no direct reachability."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+signaling = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "pydantic>=2.0",
+]
+
+# The package name (quic_dist) is declared here independent of whatever
+# directory name `git clone` happens to produce (the repo is
+# "parallel_training_quic") - `pip install -e .` from the repo root makes
+# `import quic_dist` work from anywhere, regardless of the clone
+# directory's name. The compiled Rust extension
+# (_rust_quic_engine*.so) and the vendored holepunch/ package are
+# included as package data, not built by this file - see rust/README (or
+# the top-level README) for the `cargo build --release` step that
+# produces the .so; this file only handles the Python side.
+[tool.setuptools]
+packages = ["quic_dist", "quic_dist.holepunch"]
+package-dir = { "quic_dist" = ".", "quic_dist.holepunch" = "holepunch" }
+
+[tool.setuptools.package-data]
+quic_dist = ["_rust_quic_engine*.so"]

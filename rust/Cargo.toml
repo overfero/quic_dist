@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "quic_engine",
+    "quic_engine/python",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Vendored from the parent vLLM repo's rust/Cargo.toml (rust/src/quic_engine
+# and rust/src/quic_engine/python) - quic_dist ships its own standalone copy
+# of this crate specifically so it never needs the vllm repo cloned to
+# build. Kept as its own small workspace (not a Cargo path dependency back
+# into vllm's tree) so `git clone` + `cargo build` here is genuinely
+# sufficient on its own.
+[workspace.dependencies]
+bytes = "1.12.0"
+expect-test = "1.5.1"
+libc = "0.2.177"
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+quinn-proto = "0.11.17"
+rand = "0.9.2"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+thiserror = "2.0.16"
+thiserror-ext = "0.3.0"
+vllm-quic-engine = { path = "quic_engine" }
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
+[profile.dev]
+panic = "abort"
