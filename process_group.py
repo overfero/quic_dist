@@ -262,7 +262,15 @@ class ProcessGroupQUIC(dist.ProcessGroup):
             sock.bind(("0.0.0.0", 0))
 
             own_ip, own_port = None, sock.getsockname()[1]
-            reg_resp = _hp.register(self._signaling_url, self_id, own_port)
+            # target_id=peer_id: this identity may register more than
+            # once concurrently, once per peer it's connecting to (a
+            # pipeline-parallel middle rank talks to both its predecessor
+            # and successor) - see peer.py's register()/
+            # signaling_server.py's Registration.target_id docstrings for
+            # the real bug this fixes (confirmed via a real 3-rank test:
+            # a later registration silently overwrote an earlier one
+            # still in use, without this).
+            reg_resp = _hp.register(self._signaling_url, self_id, own_port, target_id=peer_id)
             own_ip = own_ip or reg_resp["public_ip"]
 
             peer_info = _hp.wait_for_peer(self._signaling_url, self_id, peer_id)

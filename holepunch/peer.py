@@ -135,12 +135,22 @@ def other_id(self_id: str) -> str:
     return "B" if self_id.upper() == "A" else "A"
 
 
-def register(signaling_url: str, peer_id: str, udp_port: int, retries: int = 10) -> dict:
+def register(signaling_url: str, peer_id: str, udp_port: int, retries: int = 10, target_id: str | None = None) -> dict:
+    """`target_id`: the specific peer this registration is FOR - pass it
+    whenever `peer_id` might register more than once concurrently for
+    different peers (e.g. a pipeline-parallel middle rank connecting to
+    both its predecessor and successor under one identity). Without it,
+    the signaling server can't tell two of this identity's concurrent
+    registrations apart and a later one silently overwrites an earlier
+    one still in use - a real bug found via direct testing, see
+    signaling_server.py's `Registration.target_id` docstring for the
+    full story. `None` (the default) keeps the original single-pairing
+    behavior for any caller that doesn't need this."""
     for _ in range(retries):
         try:
             resp = requests.post(
                 f"{signaling_url}/register",
-                json={"peer_id": peer_id, "udp_port": udp_port},
+                json={"peer_id": peer_id, "udp_port": udp_port, "target_id": target_id},
                 timeout=5,
             )
             resp.raise_for_status()

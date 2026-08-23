@@ -19,7 +19,7 @@ file's own conventions, no new concurrency primitives needed here.
 """
 import threading
 import time
-from typing import Dict, FrozenSet
+from typing import Dict, FrozenSet, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -28,7 +28,7 @@ app = FastAPI(title="UDP Hole Punch Coordinator")
 
 SYNC_BUFFER_SECONDS = 5.0  # lead time given to both peers before they must start punching
 
-_peers: Dict[str, dict] = {}
+_peers: Dict[Tuple[str, Optional[str]], dict] = {}  # keyed by (peer_id, target_id) - see Registration.target_id
 _start_at: Dict[FrozenSet[str], float] = {}  # keyed by {peer_id, self_id} - independent per pair
 
 _kv: Dict[str, str] = {}
@@ -38,6 +38,21 @@ _kv_lock = threading.Lock()  # uvicorn can serve requests concurrently (threadpo
 class Registration(BaseModel):
     peer_id: str
     udp_port: int
+    # Who this registration is FOR - the peer that should find it via
+    # GET /peer/{peer_id}?self_id=<target_id>. Real bug found via direct
+    # testing (a 3-rank ProcessGroupQUIC pipeline, not loopback-specific -
+    # any topology where one identity connects to more than one peer):
+    # _peers used to be keyed by peer_id ALONE, so a rank registering a
+    # SECOND socket (for its second peer connection, e.g. rank1 talking
+    # to both rank0 and rank2) silently overwrote its own EARLIER
+    # registration's port. Whichever other rank was still polling for the
+    # old registration then got the WRONG port - manifesting as QUIC
+    # handshakes timing out after hole-punch itself reported success, with
+    # "NAT REBINDING DETECTED" flip-flopping between two ports as the
+    # symptom. Defaults to None for a lone/unpaired registration (keyed
+    # like before); pass this whenever the same identity might register
+    # more than once concurrently for different peers.
+    target_id: str | None = None
 
 
 def _client_ip(request: Request) -> str:
@@ -53,14 +68,18 @@ def _client_ip(request: Request) -> str:
 @app.post("/register")
 def register(reg: Registration, request: Request) -> dict:
     public_ip = _client_ip(request)  # never trust a client-supplied IP
-    prev = _peers.get(reg.peer_id)
+    key = (reg.peer_id, reg.target_id)
+    prev = _peers.get(key)
     if prev is None or prev["public_ip"] != public_ip or prev["udp_port"] != reg.udp_port:
-        # New peer_id, or its endpoint changed (restart/rebind) - drop any frozen
-        # sync times involving it so every pair it's part of renegotiates fresh,
-        # without disturbing unrelated pairs that don't involve this peer_id.
-        for pair in [p for p in _start_at if reg.peer_id in p]:
+        # New (peer_id, target_id) pair, or its endpoint changed (restart/
+        # rebind) - drop any frozen sync time for exactly this pair so it
+        # renegotiates fresh, without disturbing this identity's OTHER
+        # concurrent pairings (see Registration.target_id's docstring for
+        # why per-pair, not per-identity, is required here).
+        pair = frozenset((reg.peer_id, reg.target_id)) if reg.target_id else None
+        if pair is not None and pair in _start_at:
             del _start_at[pair]
-    _peers[reg.peer_id] = {
+    _peers[key] = {
         "peer_id": reg.peer_id,
         "public_ip": public_ip,
         "udp_port": reg.udp_port,
@@ -71,7 +90,13 @@ def register(reg: Registration, request: Request) -> dict:
 
 @app.get("/peer/{peer_id}")
 def get_peer(peer_id: str, self_id: str = Query(..., description="Caller's own peer_id")) -> dict:
-    peer = _peers.get(peer_id)
+    # Look for a registration `peer_id` made specifically targeting us
+    # (self_id) first; fall back to an unpaired/legacy registration
+    # (target_id=None) for backward compatibility with any caller that
+    # doesn't pass target_id at registration time.
+    peer = _peers.get((peer_id, self_id))
+    if peer is None:
+        peer = _peers.get((peer_id, None))
     if peer is None:
         raise HTTPException(status_code=404, detail="peer not registered yet")
     pair = frozenset((peer_id, self_id))
