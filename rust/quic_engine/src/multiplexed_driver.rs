@@ -238,16 +238,35 @@ impl ThreadState {
             }
             let end = (pending.offset + WRITE_CHUNK_BYTES).min(pending.data.len());
             let chunk_owned = pending.data[pending.offset..end].to_vec();
+            let debug = std::env::var("QUIC_DIST_RUST_DEBUG").is_ok();
             match self.engine.write_stream(stream_id, &chunk_owned) {
                 Ok(0) => {
                     let out_ch = self.out_channels.get_mut(channel_name).unwrap();
                     out_ch.blocked_on_writable = true;
                     self.transmit(now);
+                    if debug {
+                        eprintln!(
+                            "[qdist-rs] channel={channel_name} write BLOCKED (Ok(0)) offset={} total={} {}",
+                            self.out_channels[channel_name].pending.as_ref().map(|p| p.offset).unwrap_or(0),
+                            chunk_owned.len(),
+                            self.engine.debug_stats().unwrap_or_default(),
+                        );
+                    }
                     return;
                 }
                 Ok(n) => {
                     self.out_channels.get_mut(channel_name).unwrap().pending.as_mut().unwrap().offset += n;
                     self.transmit(now);
+                    if debug {
+                        let (offset, total) = {
+                            let p = self.out_channels[channel_name].pending.as_ref();
+                            (p.map(|p| p.offset).unwrap_or(0), p.map(|p| p.data.len()).unwrap_or(0))
+                        };
+                        eprintln!(
+                            "[qdist-rs] channel={channel_name} wrote n={n} offset={offset} total={total} {}",
+                            self.engine.debug_stats().unwrap_or_default(),
+                        );
+                    }
                     if n < chunk_owned.len() {
                         return; // partial, not blocked - retry next loop tick
                     }
@@ -553,6 +572,14 @@ fn run_driver_loop(
         }
 
         state.transmit(Instant::now());
+
+        if std::env::var("QUIC_DIST_RUST_DEBUG").is_ok() {
+            eprintln!(
+                "[qdist-rs] TICK poll_timeout={:?} {}",
+                state.engine.poll_timeout().map(|d| d.saturating_duration_since(Instant::now())),
+                state.engine.debug_stats().unwrap_or_default(),
+            );
+        }
 
         if shutdown.load(Ordering::SeqCst) {
             if !finish_requested {

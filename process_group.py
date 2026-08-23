@@ -117,10 +117,26 @@ _DRAIN_TIMEOUT_MS = 3000
 # of real network RTT, so this is a flow-control-accounting bug in the
 # multiplexed driver, not an RTT-pacing issue - bounding one call's
 # aggregate size does not bound the connection's total unflushed demand
-# over its lifetime. Needs real qlog-level tracing of quinn-proto's
-# write/ACK interaction to properly root-cause (see the deliverable
-# report's "recommended next steps") before it's safe to enable by
-# default. Correctness IS verified for isolated small-to-medium transfers
+# over its lifetime. Partially root-caused via direct instrumentation of
+# quinn-proto's own ConnectionStats (rust/quic_engine/src/engine.rs's
+# `debug_stats()`, gated behind QUIC_DIST_RUST_DEBUG=1 - kept in the
+# driver as a reusable diagnostic, not removed): on a real repro, `cwnd`
+# starts at quinn-proto's initial window (~12000 bytes) and does NOT grow
+# via slow start's expected exponential doubling - it grows LINEARLY, by
+# a small fixed increment (~2900 bytes) per step, with zero loss events
+# recorded (congestion_events=0) the whole time. That's congestion-
+# AVOIDANCE-style growth from the very first RTT, not slow start, for
+# reasons not yet understood (a fresh connection should slow-start until
+# a real loss or an explicit ssthresh, neither observed here). Reaching
+# enough window to cover a large message this way takes many round
+# trips; the SAME repro sometimes completes just inside a 30s window and
+# sometimes doesn't - genuinely timing/probabilistic, matching the
+# intermittent behavior observed throughout this investigation. Still
+# needs: confirming whether this is a quinn-proto NewReno quirk, a
+# BoundedController interaction (congestion.rs's wrapper - unlikely,
+# since window() only ever clamps DOWN, never explains slow linear
+# growth from a small start), or an ACK-timing issue specific to this
+# multiplexed driver's own loop. Correctness IS verified for isolated small-to-medium transfers
 # (see test_parallel_stream.py) and the code path is otherwise complete,
 # so it's left in place as an explicit opt-in via
 # QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES for anyone who wants to

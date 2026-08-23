@@ -322,6 +322,26 @@ impl Engine {
     /// to pick this without OS-level GSO-capability probing, which this
     /// crate doesn't do, so borrowing the ecosystem's own answer is more
     /// defensible than guessing a fresh number).
+    /// One-line snapshot of quinn-proto's own real congestion/flow-control
+    /// state - added specifically to investigate the parallel-stream
+    /// cumulative-demand stall (see multiplexed_driver.rs's module
+    /// docstring and the deliverable report's &sect;7): whether writes are
+    /// genuinely blocked on congestion window, and what RTT/loss quinn-
+    /// proto itself is observing, rather than guessing from the outside.
+    pub fn debug_stats(&self) -> Option<String> {
+        let (_, connection) = self.connection.as_ref()?;
+        let stats = connection.stats();
+        Some(format!(
+            "cwnd={} rtt={:?} congestion_events={} lost_packets={} lost_bytes={} sent_packets={}",
+            stats.path.cwnd,
+            stats.path.rtt,
+            stats.path.congestion_events,
+            stats.path.lost_packets,
+            stats.path.lost_bytes,
+            stats.path.sent_packets,
+        ))
+    }
+
     pub fn poll_transmit(&mut self, now: Instant) -> Vec<OutDatagram> {
         self.drain_endpoint_events();
         const MAX_GSO_DATAGRAMS: usize = 10;
