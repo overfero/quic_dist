@@ -20,6 +20,17 @@ signaling = [
     "uvicorn>=0.23",
     "pydantic>=2.0",
 ]
+# quic_dist.finetune's config-driven pipeline LoRA/QLoRA training - kept
+# optional since the core transport (ProcessGroupQUIC/QuicRendezvousStore)
+# has no dependency on any of this.
+finetune = [
+    "transformers>=4.40",
+    "peft>=0.10",
+    "bitsandbytes>=0.43",
+    "accelerate>=0.30",
+    "datasets>=2.18",
+    "pyyaml>=6.0",
+]
 
 # The package name (quic_dist) is declared here independent of whatever
 # directory name `git clone` happens to produce (the repo is

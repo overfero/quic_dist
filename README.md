@@ -59,6 +59,30 @@ Every collective (`all_reduce`, `all_gather`, `broadcast`, ...) raises
 `NotImplementedError` by explicit design — not a silent no-op, not a
 fallback to another backend.
 
+## Config-driven pipeline LoRA/QLoRA fine-tuning
+
+`quic_dist.finetune` extracts the boilerplate that's identical across any
+N-stage pipeline-parallel LoRA/QLoRA run over this transport — per-rank
+`device_map` construction (including uneven layer splits, for a boundary
+stage carrying extra fixed weight like a large `lm_head`), the generic
+recv→layers→send forward/backward loop for any world size, and the
+quic_dist init/teardown. A new causal-LM model/dataset needs a config, not
+a new training script:
+
+```bash
+pip install -e ".[finetune]"   # transformers, peft, bitsandbytes, accelerate, datasets, pyyaml
+cd tests
+python3 pipeline_finetune_rank.py configs/qwen25_0.5b_lora.yaml <rank> <signaling_url>
+```
+
+See `tests/configs/` for two real, validated examples — a 2-stage plain
+LoRA run (`qwen25_0.5b_lora.yaml`) and a 4-stage real QLoRA run on a ~27B
+hybrid-attention model across 2 real machines
+(`qwen38_27b_qlora.yaml`, loss 0.6973 → 0.2734 over 3 real epochs) — and
+`quic_dist/finetune.py`'s own docstring for what's deliberately NOT
+covered (non-text modalities stay their own script; see
+`vision_pipeline_rank.py`).
+
 ## Tests
 
 ```bash
@@ -69,13 +93,14 @@ python3 -m pytest test_store.py test_process_group.py test_pipeline.py test_para
 
 These spin up a real local signaling server and real hole-punched QUIC
 connections (loopback) — no mocking. `cross_machine_rank.py`,
-`lora_pipeline_rank.py`, `real_llm_pipeline_rank.py`, and
-`vision_shape_rank.py` are standalone scripts for real cross-machine
-testing (run one instance per machine, pointed at a real publicly
-reachable signaling URL).
+`lora_pipeline_rank.py`, `real_llm_pipeline_rank.py`,
+`vision_shape_rank.py`, `vision_pipeline_rank.py`,
+`n3_cross_machine_rank.py`, and `pipeline_finetune_rank.py` are
+standalone scripts for real cross-machine testing (run one instance per
+machine/rank, pointed at a real publicly reachable signaling URL).
 
 ## Known limitations
 
 See the full deliverable report for the complete architecture, design
 rationale, and an honest list of what's implemented vs. not:
-https://claude.ai/code/artifact/96117257-82d9-476a-ade9-aba41a56b8f4
+https://claude.ai/code/artifact/6677daa1-801f-44c9-b6b5-d42880632c6b

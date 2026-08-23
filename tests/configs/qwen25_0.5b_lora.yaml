@@ -1,0 +1,38 @@
+# Same model/topology as real_llm_pipeline_rank.py's real, validated
+# proof (Qwen2.5-0.5B, 2-stage pipeline, real LoRA on a plain
+# AutoModelForCausalLM - that script's own real cross-machine run,
+# local <-> akun5, got loss 4.2504 -> 3.5079). Uses this module's
+# generic per-example dataset loader here (real_llm_pipeline_rank.py
+# itself does its own continuous-text chunking of tiny_shakespeare
+# instead - a genuinely different data pipeline, not reproduced by
+# build_dataset() below - so this config uses a real per-example
+# instruction dataset instead, to stay honest about what this generic
+# path actually does).
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen25_0.5b_lora.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24  # Qwen2.5-0.5B has 24 decoder layers
+
+# layers_attr/embed_attr/norm_attr/lm_head_attr/rotary_attr all keep
+# their defaults - a plain AutoModelForCausalLM nests at model.layers,
+# model.embed_tokens, model.norm, model.rotary_emb, lm_head.
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"   # set to "none" for plain LoRA, "8bit" for int8
+compute_dtype: float16 # matches this model's native dtype - see finetune.py's
+                        # docstring on why this must match, not just "a reasonable choice"
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 256
+text_field: text
+
+seq_len: 128
+batch: 4
+epochs: 1
+lr: 0.0001

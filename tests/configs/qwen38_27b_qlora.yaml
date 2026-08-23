@@ -1,0 +1,64 @@
+# Reproduces qwen38_27b_pipeline_rank.py's real, validated run exactly:
+# Qwen3.8-27B (architecture qwen3_5, hybrid linear/full-attention, 64
+# layers), 4-stage pipeline, real QLoRA. Real run (2 machines, 4 T4s,
+# one genuine cross-machine hop): loss 0.6973 -> 0.2734 (epoch avg),
+# final step loss 0.1172, 192 steps in 1068.9s.
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen38_27b_qlora.yaml <rank> <signaling_url>
+# (rank in 0..3; local GPU used is rank % torch.cuda.device_count())
+
+model_path: /models/qwen38_27b
+world_size: 4
+num_layers: 64
+
+# AutoModelForCausalLM.from_pretrained resolves this config to
+# Qwen3_5ForCausalLM (text-only, no vision tower) - but ONE level
+# deeper than a plain CausalLM: model.model.layers, not model.layers.
+# Confirmed via a meta-device skeleton inspection, not assumed - see
+# qwen38_27b_pipeline_rank.py's module docstring.
+layers_attr: model.model.layers
+embed_attr: model.model.embed_tokens
+norm_attr: model.model.norm
+rotary_attr: model.model.rotary_emb
+lm_head_attr: model.lm_head
+
+# Uneven split - rank3 (last stage) carries lm_head (5120 x 248320,
+# unquantized) + norm on top of whatever decoder layers it holds, at
+# ~2.5GB extra fixed cost no other rank pays. A real CUDA OOM (twice,
+# in two different places) at an even 16/16/16/16 split is what forced
+# this rebalance - see qwen38_27b_pipeline_rank.py's history.
+stage_layer_counts: [17, 17, 18, 12]
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [gate_proj, up_proj]  # NOT the attention projections - this
+  # architecture's two block types (linear_attention vs full_attention) name
+  # their attention projections completely differently; gate_proj/up_proj
+  # (the MLP) are the one thing present identically on every layer regardless
+  # of block_type - see qwen38_27b_pipeline_rank.py's module docstring.
+
+quantization: "4bit"
+compute_dtype: bfloat16  # this model's real native dtype - fp16 crashed a
+                          # real run with a dtype-mismatch RuntimeError, see
+                          # qwen38_27b_pipeline_rank.py's history.
+cpu_offload_unused_layers: true  # required - see build_device_map()'s docstring
+  # in quic_dist/finetune.py for why "cpu" + this flag is what actually keeps
+  # the OTHER 3 stages' layers off THIS rank's GPU at zero real memory cost.
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 64
+text_field: text
+
+seq_len: 48   # reduced from an original 96 - the linear-attention reference
+              # implementation (no fused kernel installed in the real run's
+              # venv) is memory-hungry and scales with sequence length; this
+              # was the fix for a real CUDA OOM inside that forward pass.
+batch: 1
+epochs: 3
+lr: 0.0001
+connect_timeout_s: 1800  # a full forward pass through the linear-attention
+  # reference kernel (no fused kernel) is genuinely slow the first time
+  # (cold-start ~20-85s observed); a short default timeout here is what
+  # produced the ConnectionError TimedOut failures seen before this fix.
+log_every: 16
