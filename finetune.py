@@ -1,7 +1,7 @@
 """Generic N-stage pipeline-parallel LoRA/QLoRA fine-tuning, config-driven.
 
 Extracts the boilerplate that was duplicated across every
-*_pipeline_rank.py causal-LM training script in tests/
+*_pipeline_rank.py causal-LM training script in examples/
 (real_llm_pipeline_rank.py's Qwen2.5-0.5B, qwen38_27b_pipeline_rank.py's
 Qwen3.8-27B hybrid-attention model) - a new model/dataset combination
 needs a `PipelineConfig`, not a new copy of the training loop. What's
@@ -37,8 +37,8 @@ script; use this module for text/causal-LM LoRA and QLoRA.
 Usage: write a `PipelineConfig` (directly, or loaded from YAML/JSON via
 `PipelineConfig.from_file`), then call `run_pipeline_training(rank,
 signaling_url, config, job_id=...)` from a tiny per-model launcher
-script - see tests/pipeline_finetune_rank.py and the example configs
-under tests/configs/ for two real, validated examples (0.5B and 27B).
+script - see examples/pipeline_finetune_rank.py and the example configs
+under examples/configs/ for two real, validated examples (0.5B and 27B).
 """
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ class PipelineConfig:
                                               # rank's whole slice even quantized - see
                                               # build_device_map()'s docstring
 
-    # Peft/torchao environment workaround - see tests/real_llm_pipeline_rank.py's
+    # Peft/torchao environment workaround - see examples/real_llm_pipeline_rank.py's
     # module docstring for the real bug this works around in this project's
     # environment (peft probing an incompatible torchao unconditionally).
     patch_torchao_check: bool = True
@@ -267,7 +267,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     returns the last-stage's per-step loss list (empty on non-last
     ranks). Blocks until training completes; the caller's script is
     just this call plus argument parsing - see
-    tests/pipeline_finetune_rank.py."""
+    examples/pipeline_finetune_rank.py."""
     if local_gpu is None:
         local_gpu = rank % torch.cuda.device_count()
     device = torch.device(f"cuda:{local_gpu}")

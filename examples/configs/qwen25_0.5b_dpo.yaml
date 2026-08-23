@@ -1,0 +1,32 @@
+# DPO on the same model/topology as qwen25_0.5b_lora.yaml (Qwen2.5-0.5B,
+# 2-stage pipeline). Reference logps come from peft's disable_adapter()
+# on the SAME model - no second model ever loaded, see rlhf.py's
+# docstring.
+#
+# Run: python3 dpo_pipeline_rank.py configs/qwen25_0.5b_dpo.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16   # matches this model's native dtype, same as qwen25_0.5b_lora.yaml
+
+beta: 0.1
+dataset_name: Intel/orca_dpo_pairs
+dataset_split: train
+num_examples: 64
+prompt_field: question
+chosen_field: chosen
+rejected_field: rejected
+
+max_prompt_len: 64
+max_response_len: 64
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 4

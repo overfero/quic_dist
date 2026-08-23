@@ -71,17 +71,49 @@ a new training script:
 
 ```bash
 pip install -e ".[finetune]"   # transformers, peft, bitsandbytes, accelerate, datasets, pyyaml
-cd tests
+cd examples
 python3 pipeline_finetune_rank.py configs/qwen25_0.5b_lora.yaml <rank> <signaling_url>
 ```
 
-See `tests/configs/` for two real, validated examples — a 2-stage plain
+See `examples/configs/` for two real, validated examples — a 2-stage plain
 LoRA run (`qwen25_0.5b_lora.yaml`) and a 4-stage real QLoRA run on a ~27B
 hybrid-attention model across 2 real machines
 (`qwen38_27b_qlora.yaml`, loss 0.6973 → 0.2734 over 3 real epochs) — and
 `quic_dist/finetune.py`'s own docstring for what's deliberately NOT
 covered (non-text modalities stay their own script; see
 `vision_pipeline_rank.py`).
+
+## Config-driven pipeline DPO/GRPO/PPO
+
+`quic_dist.rlhf` covers RLHF-style training the same way `finetune.py`
+covers SFT: a config, not a new script. All three reuse `finetune.py`'s
+model-loading (`build_stage_model`) directly, and DPO/GRPO/PPO all get
+their reference-model log-probs for free via peft's `disable_adapter()`
+context manager on the SAME model - no second model is ever loaded.
+GRPO and PPO add real pipeline-parallel autoregressive generation
+(`rlhf.pipeline_generate` - each new token is one full round trip
+through every stage, with each stage keeping its own local KV cache
+across steps); PPO additionally attaches a real learned value head at
+the last stage and runs genuine GAE + a clipped surrogate loss over
+`ppo_epochs` inner update passes per rollout (GRPO deliberately skips
+that inner-epoch loop - see `GRPOConfig`'s docstring for why its
+importance ratio is always 1, unlike PPO's).
+
+```bash
+cd examples
+python3 dpo_pipeline_rank.py configs/qwen25_0.5b_dpo.yaml <rank> <signaling_url>
+python3 grpo_pipeline_rank.py configs/qwen25_0.5b_grpo.yaml <rank> <signaling_url>
+python3 ppo_pipeline_rank.py configs/qwen25_0.5b_ppo.yaml <rank> <signaling_url>
+```
+
+All three configs are real, validated (loopback) examples on
+Qwen2.5-0.5B: DPO loss 0.6931 → 0.3663 (avg last 8 steps), GRPO reward
+0.775 → 0.803, PPO reward held ~0.72-0.75 while the clipped policy loss
+and value loss both dropped. `rlhf.default_reward_fn` (GRPO/PPO) is a
+real, deterministic, rule-based scorer (lexical diversity + a length
+target) - documented in its own docstring as a stand-in good enough to
+prove the mechanism, not a trained reward model; pass your own
+`reward_fn` to `run_grpo_training`/`run_ppo_training` for a real one.
 
 ## Tests
 
@@ -92,12 +124,15 @@ python3 -m pytest test_store.py test_process_group.py test_pipeline.py test_para
 ```
 
 These spin up a real local signaling server and real hole-punched QUIC
-connections (loopback) — no mocking. `cross_machine_rank.py`,
-`lora_pipeline_rank.py`, `real_llm_pipeline_rank.py`,
-`vision_shape_rank.py`, `vision_pipeline_rank.py`,
-`n3_cross_machine_rank.py`, and `pipeline_finetune_rank.py` are
-standalone scripts for real cross-machine testing (run one instance per
-machine/rank, pointed at a real publicly reachable signaling URL).
+connections (loopback) — no mocking, and live in `tests/` alongside
+their own `_helpers.py`. `examples/` holds the standalone,
+directly-run scripts (`cross_machine_rank.py`, `lora_pipeline_rank.py`,
+`real_llm_pipeline_rank.py`, `vision_shape_rank.py`,
+`vision_pipeline_rank.py`, `n3_cross_machine_rank.py`,
+`pipeline_finetune_rank.py`, `dpo_pipeline_rank.py`,
+`grpo_pipeline_rank.py`, `ppo_pipeline_rank.py`, `bench_quic_dist.py`)
+plus the `configs/` and `data/` they read from - run one instance per
+machine/rank, pointed at a real publicly reachable signaling URL.
 
 ## Known limitations
 

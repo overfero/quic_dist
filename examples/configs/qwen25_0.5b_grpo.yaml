@@ -1,0 +1,36 @@
+# GRPO on the same model/topology as qwen25_0.5b_lora.yaml/qwen25_0.5b_dpo.yaml
+# (Qwen2.5-0.5B, 2-stage pipeline). Rollout is real pipeline-parallel
+# autoregressive decoding (rlhf.pipeline_generate) - each new token is a
+# full round trip through both stages, each stage keeping its own local
+# KV cache. Reference logps come from peft's disable_adapter(), same
+# free-reference trick as DPO. Reward is a real, deterministic,
+# rule-based scorer (lexical diversity + length target) - see
+# rlhf.default_reward_fn's docstring for why that's honest for proving
+# the mechanism, not a trained reward model.
+#
+# Run: python3 grpo_pipeline_rank.py configs/qwen25_0.5b_grpo.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 16
+prompt_field: instruction
+max_prompt_len: 32
+
+group_size: 4
+max_new_tokens: 16
+temperature: 1.0
+kl_coef: 0.05
+epochs: 1
+lr: 0.0001
+log_every: 2

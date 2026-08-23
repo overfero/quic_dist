@@ -1,0 +1,37 @@
+# PPO on the same model/topology as the DPO/GRPO 0.5B configs. Adds a
+# real learned value head (last stage only) and GAE advantages, with 2
+# clipped-surrogate inner update passes per rollout (ppo_epochs) - the
+# part GRPO's config deliberately skips (see rlhf.py's GRPOConfig
+# docstring on why its ratio is always 1).
+#
+# Run: python3 ppo_pipeline_rank.py configs/qwen25_0.5b_ppo.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 12
+prompt_field: instruction
+max_prompt_len: 32
+
+group_size: 4
+max_new_tokens: 16
+temperature: 1.0
+kl_coef: 0.05
+gamma: 1.0
+gae_lambda: 0.95
+clip_eps: 0.2
+vf_coef: 0.5
+ppo_epochs: 2
+epochs: 1
+lr: 0.0001
+log_every: 2
