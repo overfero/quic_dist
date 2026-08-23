@@ -118,6 +118,31 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
     return local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
+def _step_barrier(signaling_url, config, tag: str, timeout_s: int = 300):
+    """A REAL per-step barrier - unlike `dist.barrier()`, which is only
+    safe to call ONCE per process group's lifetime. Found via a real
+    cross-machine GRPO run: PyTorch's own `_store_based_barrier` keys
+    its store entry ONLY by the process group's name
+    (`f"{STORE_BASED_BARRIER_PREFIX}:{group_name}"`, confirmed by
+    reading its source directly), not by call site or call count. A
+    SECOND `dist.barrier()` call in the same process group reads that
+    already-satisfied key from the FIRST call and returns immediately -
+    a real, silent no-op providing zero actual synchronization, which
+    is exactly why adding a per-step `dist.barrier()` after the
+    existing load-time one did not fix the timeout it was meant to fix.
+    This reimplements the same add-then-wait-for-last-worker pattern
+    directly against the store, with a fresh key per `tag` so each call
+    is genuinely independent of every other barrier in the run."""
+    from quic_dist.store import QuicRendezvousStore
+
+    store = QuicRendezvousStore(signaling_url, timeout=timedelta(seconds=timeout_s))
+    key = f"step_barrier_{tag}"
+    count = store.add(key, 1)
+    if count == config.world_size:
+        store.set(f"{key}:done", "1")
+    store.wait([f"{key}:done"])
+
+
 def _teardown(rank):
     dist.barrier()
     pg = dist.distributed_c10d._get_default_group()
@@ -233,6 +258,17 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
     prev_rank = rank - 1 if rank > 0 else None
     next_rank = rank + 1 if rank < config.world_size - 1 else None
 
+    # Real bug found via a cross-machine 27B run: model loading (esp.
+    # quantized, multi-GB) takes very different real wall-clock time per
+    # rank (disk speed, machine load) - without a barrier here, a
+    # fast-loading rank can reach the training loop and start sending
+    # real tensors while a slow-loading rank is still mid-load, and the
+    # underlying QUIC connection's own idle timeout closes the
+    # connection before the slow rank ever gets there. This barrier
+    # forces every rank to finish loading before ANY of them proceeds.
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
+
     trainable = [p for p in peft_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
@@ -281,6 +317,19 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
 
     for epoch in range(config.epochs):
         for b in range(n_steps):
+            # Real bug found via a cross-machine 27B GRPO run (same
+            # class as the load-time barrier, different location): one
+            # rank finishing a step's bookkeeping faster than another
+            # leaves the SLOWER rank's peer connection idle long enough
+            # for the underlying QUIC connection's own idle timeout to
+            # fire before the next step's first send/recv - DPO's single
+            # forward+backward per step never left enough of a gap to
+            # trigger this, but it's a real risk on any step whose
+            # per-rank work is uneven or slow, so it's applied here too
+            # even though this exact run didn't fail. Uses _step_barrier,
+            # NOT dist.barrier() - see that function's docstring for why
+            # a second dist.barrier() call is a silent no-op.
+            _step_barrier(signaling_url, config, f"dpo_{epoch}_{b}")
             step_counter += 1
             tag_ref = (step_counter % 4) * 2
             tag_policy = tag_ref + 1
@@ -343,6 +392,498 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
 
 
 # ---------------------------------------------------------------------------
+# Reward Model (RM) - outcome reward model, Bradley-Terry pairwise loss,
+# ONE scalar reward per full sequence. Trained checkpoints from this
+# section are what makes run_ppo_training/run_grpo_training's `rm=`
+# argument real: instead of default_reward_fn's rule-based text
+# heuristic, PPO/GRPO can score rollouts with an actual trained model
+# via a genuine pipeline-parallel forward pass (pipeline_score(),
+# below the PRM section) - this is the "end-to-end RLHF" path.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RMConfig(RLHFModelConfig):
+    dataset_name: str = "Intel/orca_dpo_pairs"
+    dataset_split: str = "train"
+    num_examples: int | None = 64
+    prompt_field: str = "question"
+    chosen_field: str = "chosen"
+    rejected_field: str = "rejected"
+
+    max_prompt_len: int = 64
+    max_response_len: int = 64
+
+    # Small centering regularizer (InstructGPT-style): the Bradley-Terry
+    # loss below only ever supervises the DIFFERENCE r_chosen-r_rejected,
+    # so the reward scale itself is free to drift arbitrarily without
+    # this - a real, well-known stabilization term, not defensive
+    # programming for a case that can't happen.
+    reward_l2_coef: float = 0.001
+
+    batch: int = 1  # pairs per step; pipeline batch is 2x this (chosen+rejected concatenated)
+    epochs: int = 1
+
+    # Directory to save this rank's trained LoRA adapter + (last stage
+    # only) reward_head to - see save_reward_stage(). None = don't save
+    # (e.g. a pure mechanism-check run).
+    save_path: str | None = None
+
+    @classmethod
+    def from_file(cls, path: str) -> "RMConfig":
+        return cls(**cls._load_raw(path))
+
+    @property
+    def seq_len(self) -> int:
+        return self.max_prompt_len + self.max_response_len
+
+
+def _last_marked_idx(mask: torch.Tensor) -> torch.Tensor:
+    """mask: (B, T) 0/1, the 1s forming a single contiguous run (e.g.
+    build_dpo_dataset's response region). Returns (B,) the index of the
+    LAST 1 in each row - the position whose hidden state has attended
+    to the entire prompt+response, i.e. the position a reward head
+    should read from. Multiplying by an increasing arange and taking
+    argmax finds the last (highest-index) 1; plain mask.argmax(dim=1)
+    would find the FIRST 1 instead, which is wrong here."""
+    T = mask.shape[1]
+    positions = torch.arange(T, device=mask.device).unsqueeze(0)
+    return (mask * positions).argmax(dim=1)
+
+
+def save_reward_stage(rank: int, config, peft_model, reward_head, save_dir: str) -> None:
+    """Saves this rank's own slice of a trained reward model (an ORM
+    from run_rm_training, or a PRM from run_prm_training - identical
+    physical shape, only the training objective differs): the LoRA
+    adapter via peft's own save_pretrained, plus, on the last stage
+    only (where reward_head is not None), the reward head's raw
+    weights. One subdirectory per rank since every rank only ever
+    holds ITS OWN layer slice, mirroring build_stage_model - see
+    load_reward_model() for the matching loader."""
+    from pathlib import Path
+
+    rank_dir = Path(save_dir) / f"rank{rank}"
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    peft_model.save_pretrained(str(rank_dir))
+    if reward_head is not None:
+        torch.save(reward_head.state_dict(), rank_dir / "reward_head.pt")
+    print(f"[rank {rank}] saved reward model checkpoint to {rank_dir}", flush=True)
+
+
+def run_rm_training(rank: int, signaling_url: str, config: RMConfig, job_id: str = "rm_pipeline") -> list[float]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = _init_rank(
+        rank, signaling_url, config, job_id
+    )
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+    prev_rank = rank - 1 if rank > 0 else None
+    next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
+
+    trainable = [p for p in peft_model.parameters() if p.requires_grad]
+    # Reward head lives ONLY on the last stage, right next to
+    # norm/lm_head - same placement pattern as PPO's value_head (both
+    # read the same post-norm hidden states, both are a fresh
+    # untrained fp32 head - not worth quantizing/downcasting).
+    reward_head = None
+    if is_last:
+        reward_head = nn.Linear(hidden_size, 1).to(device=device, dtype=torch.float32)
+        trainable = trainable + list(reward_head.parameters())
+    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+
+    # Reused UNCHANGED from the DPO section above - RMConfig declares
+    # the exact same field names (prompt_field/chosen_field/
+    # rejected_field/max_prompt_len/max_response_len/seq_len/batch/
+    # dataset_name/dataset_split/num_examples) build_dpo_dataset needs,
+    # and the (input_ids, response_mask) shape it returns is exactly
+    # what RM training needs too - real reuse, not a copy.
+    input_ids_all, response_mask_all = build_dpo_dataset(tokenizer, config)
+    n_steps = input_ids_all.shape[0]
+    total_steps = n_steps * config.epochs
+    pbatch = 2 * config.batch  # chosen+rejected concatenated
+    seq_len = config.seq_len   # no -1 shift here: RM pools ONE hidden state per
+                                # sequence, it never predicts next-token logits
+    print(f"[rank {rank}] RM: {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps, "
+          f"pipeline batch {pbatch} (={config.batch} pairs x2)", flush=True)
+
+    losses: list[float] = []
+    t_start = time.monotonic()
+    step_counter = 0
+
+    for epoch in range(config.epochs):
+        for b in range(n_steps):
+            _step_barrier(signaling_url, config, f"rm_{epoch}_{b}")
+            step_counter += 1
+            tag = step_counter % 8
+            block = input_ids_all[b]
+            mask = response_mask_all[b].to(device)
+            optimizer.zero_grad()
+
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(pbatch, -1)
+            if is_first:
+                hidden = embed(block.to(device)).to(config.torch_dtype)
+                hidden_in = None
+            else:
+                recv_buf = torch.zeros(pbatch, seq_len, hidden_size, dtype=config.torch_dtype)
+                dist.recv(recv_buf, src=prev_rank, tag=tag)
+                hidden_in = recv_buf.to(device).requires_grad_(True)
+                hidden = hidden_in
+
+            pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+            out = hidden
+            for layer in stage_layers:
+                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+
+            if is_last:
+                normed = norm(out)
+                reward_all = reward_head(normed.float()).squeeze(-1)  # (pbatch, seq_len)
+                idx = _last_marked_idx(mask)                          # (pbatch,)
+                reward = reward_all.gather(1, idx.unsqueeze(1)).squeeze(1)  # (pbatch,)
+
+                B = config.batch
+                r_chosen, r_rejected = reward[:B], reward[B:]
+                bt_loss = -F.logsigmoid(r_chosen - r_rejected).mean()
+                l2 = (r_chosen.pow(2) + r_rejected.pow(2)).mean()
+                loss = bt_loss + config.reward_l2_coef * l2
+                loss.backward()
+                losses.append(loss.item())
+            else:
+                dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+                grad = torch.zeros(pbatch, seq_len, hidden_size, dtype=config.torch_dtype)
+                dist.recv(grad, src=next_rank, tag=tag)
+                out.backward(grad.to(device))
+
+            if not is_first:
+                dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
+
+            optimizer.step()
+            if step_counter <= 3 or step_counter % config.log_every == 0:
+                msg = f"[rank {rank}] step {step_counter}/{total_steps}"
+                if is_last:
+                    acc = (r_chosen > r_rejected).float().mean().item()
+                    msg += f" rm_loss={losses[-1]:.4f} acc={acc:.3f}"
+                print(msg, flush=True)
+
+        elapsed = time.monotonic() - t_start
+        if is_last:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} loss={losses[-1]:.4f} elapsed={elapsed:.1f}s", flush=True)
+        else:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} elapsed={elapsed:.1f}s", flush=True)
+
+    total_elapsed = time.monotonic() - t_start
+    print(f"[rank {rank}] RM training DONE in {total_elapsed:.1f}s ({total_steps} steps)", flush=True)
+    if is_last and losses:
+        print(f"[rank {rank}] loss avg first {min(8,len(losses))} steps: {sum(losses[:8])/min(8,len(losses)):.4f}", flush=True)
+        print(f"[rank {rank}] loss avg last {min(8,len(losses))} steps:  {sum(losses[-8:])/min(8,len(losses)):.4f}", flush=True)
+
+    if config.save_path:
+        save_reward_stage(rank, config, peft_model, reward_head, config.save_path)
+
+    _teardown(rank)
+    return losses
+
+
+# ---------------------------------------------------------------------------
+# Process Reward Model (PRM) - scores EACH reasoning step, not just the
+# final outcome. Trained on peiyi9979/Math-Shepherd (real, verified
+# schema: `label` is the same solution text as `input` but with each
+# step's trailing "ки" marker replaced by "+"/"-" for correct/
+# incorrect - confirmed by loading the dataset directly, not assumed
+# from a stale description). One scalar prediction PER STEP-BOUNDARY
+# token position, trained with per-step binary cross-entropy - the same
+# approach PRM800K/Math-Shepherd's own papers use (a step's classifier
+# token sits right after that step's content; this implementation reads
+# the score at the LAST content token of each step instead of adding a
+# separate classifier token, functionally equivalent and simpler since
+# it needs no vocabulary/embedding changes).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PRMConfig(RLHFModelConfig):
+    dataset_name: str = "peiyi9979/Math-Shepherd"
+    dataset_split: str = "train"
+    num_examples: int | None = 64
+    label_field: str = "label"       # already has per-step "+"/"-" applied - see module docstring above
+    step_positive_marker: str = "+"
+    step_negative_marker: str = "-"
+
+    max_len: int = 256     # full prompt+steps token budget
+    max_steps: int = 8     # cap step-boundary positions scored per example; extra steps truncated
+
+    epochs: int = 1
+    save_path: str | None = None
+
+    @classmethod
+    def from_file(cls, path: str) -> "PRMConfig":
+        return cls(**cls._load_raw(path))
+
+    @property
+    def seq_len(self) -> int:
+        return self.max_len
+
+
+def _parse_math_shepherd_label(label_text: str, pos_marker: str, neg_marker: str):
+    """Math-Shepherd's `label` field is the solution broken into lines,
+    one step per line, each ending in " +" or " -" (see module
+    docstring). Returns (step_texts, step_labels) - step_texts has the
+    trailing marker stripped, step_labels is 1 for pos_marker, 0 for
+    neg_marker. A line ending in neither is skipped (malformed/
+    boundary artifact, not assumed to happen but not fatal if it does)."""
+    step_texts, step_labels = [], []
+    for line in label_text.split("\n"):
+        line = line.rstrip()
+        if line.endswith(pos_marker):
+            step_labels.append(1)
+            step_texts.append(line[: -len(pos_marker)].rstrip())
+        elif line.endswith(neg_marker):
+            step_labels.append(0)
+            step_texts.append(line[: -len(neg_marker)].rstrip())
+    return step_texts, step_labels
+
+
+def build_prm_dataset(tokenizer, config: PRMConfig) -> list[dict]:
+    """Returns a flat list of {input_ids: (T,), step_positions: (S,),
+    step_labels: (S,)} - kept ragged (not stacked into one fixed-shape
+    tensor like build_dataset/build_dpo_dataset) because both T and S
+    genuinely vary per example. run_prm_training processes one example
+    per pipeline step (batch=1) specifically so this ragged shape never
+    needs padding/collation - see its docstring."""
+    from datasets import load_dataset
+
+    split = config.dataset_split if config.num_examples is None else f"{config.dataset_split}[:{config.num_examples}]"
+    ds = load_dataset(config.dataset_name, split=split)
+
+    examples = []
+    for ex in ds:
+        step_texts, step_labels = _parse_math_shepherd_label(
+            ex[config.label_field], config.step_positive_marker, config.step_negative_marker
+        )
+        if not step_texts:
+            continue
+        step_texts = step_texts[: config.max_steps]
+        step_labels = step_labels[: config.max_steps]
+
+        ids: list[int] = []
+        step_positions: list[int] = []
+        for text in step_texts:
+            piece_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            if not piece_ids:
+                continue
+            ids.extend(piece_ids)
+            step_positions.append(len(ids) - 1)  # this step's LAST token index
+
+        if not step_positions:
+            continue
+        if len(ids) > config.max_len:
+            # Truncate to the token budget - drop any step whose
+            # boundary position would fall outside it rather than
+            # silently scoring at a clipped/wrong position.
+            keep_n = sum(1 for pos in step_positions if pos < config.max_len)
+            if keep_n == 0:
+                continue
+            step_positions = step_positions[:keep_n]
+            step_labels = step_labels[:keep_n]
+            ids = ids[: config.max_len]
+
+        examples.append({
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "step_positions": torch.tensor(step_positions, dtype=torch.long),
+            "step_labels": torch.tensor(step_labels, dtype=torch.float32),
+        })
+    return examples
+
+
+def run_prm_training(rank: int, signaling_url: str, config: PRMConfig, job_id: str = "prm_pipeline") -> list[float]:
+    """Real batch=1-per-step training (see build_prm_dataset's
+    docstring for why): every rank independently builds the SAME
+    dataset deterministically (identical tokenizer, identical dataset,
+    no randomness) - the exact same redundant-construction pattern
+    run_dpo_training already relies on for input_ids_all, so shapes
+    agree across ranks with zero network broadcast needed for this
+    part (unlike pipeline_generate's prompt_len broadcast, which exists
+    because ITS prompt genuinely originates on one specific rank)."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = _init_rank(
+        rank, signaling_url, config, job_id
+    )
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+    prev_rank = rank - 1 if rank > 0 else None
+    next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
+
+    trainable = [p for p in peft_model.parameters() if p.requires_grad]
+    reward_head = None
+    if is_last:
+        # Same head shape as the ORM's reward_head above - PRM just
+        # reads it at MULTIPLE positions per sequence (one per
+        # reasoning step) instead of pooling once at the end.
+        reward_head = nn.Linear(hidden_size, 1).to(device=device, dtype=torch.float32)
+        trainable = trainable + list(reward_head.parameters())
+    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+
+    examples = build_prm_dataset(tokenizer, config)
+    n_steps = len(examples)
+    total_steps = n_steps * config.epochs
+    print(f"[rank {rank}] PRM: {config.epochs} epochs x {n_steps} examples = {total_steps} steps", flush=True)
+
+    losses: list[float] = []
+    t_start = time.monotonic()
+    step_counter = 0
+
+    for epoch in range(config.epochs):
+        for ex in examples:
+            _step_barrier(signaling_url, config, f"prm_{step_counter}")
+            step_counter += 1
+            tag = step_counter % 8
+            input_ids = ex["input_ids"].unsqueeze(0)  # (1, T)
+            step_positions = ex["step_positions"].to(device)
+            step_labels = ex["step_labels"].to(device)
+            T = input_ids.shape[1]
+            optimizer.zero_grad()
+
+            position_ids = torch.arange(T, device=device).unsqueeze(0)
+            if is_first:
+                hidden = embed(input_ids.to(device)).to(config.torch_dtype)
+                hidden_in = None
+            else:
+                recv_buf = torch.zeros(1, T, hidden_size, dtype=config.torch_dtype)
+                dist.recv(recv_buf, src=prev_rank, tag=tag)
+                hidden_in = recv_buf.to(device).requires_grad_(True)
+                hidden = hidden_in
+
+            pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+            out = hidden
+            for layer in stage_layers:
+                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+
+            if is_last:
+                normed = norm(out)
+                step_scores = reward_head(normed[0, step_positions, :].float()).squeeze(-1)  # (S,)
+                loss = F.binary_cross_entropy_with_logits(step_scores, step_labels)
+                loss.backward()
+                losses.append(loss.item())
+            else:
+                dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+                grad = torch.zeros(1, T, hidden_size, dtype=config.torch_dtype)
+                dist.recv(grad, src=next_rank, tag=tag)
+                out.backward(grad.to(device))
+
+            if not is_first:
+                dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
+
+            optimizer.step()
+            if step_counter <= 3 or step_counter % config.log_every == 0:
+                msg = f"[rank {rank}] step {step_counter}/{total_steps}"
+                if is_last:
+                    pred = (torch.sigmoid(step_scores) > 0.5).float()
+                    acc = (pred == step_labels).float().mean().item()
+                    msg += f" prm_loss={losses[-1]:.4f} step_acc={acc:.3f} n_steps={step_labels.numel()}"
+                print(msg, flush=True)
+
+        elapsed = time.monotonic() - t_start
+        if is_last:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} loss={losses[-1]:.4f} elapsed={elapsed:.1f}s", flush=True)
+        else:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} elapsed={elapsed:.1f}s", flush=True)
+
+    total_elapsed = time.monotonic() - t_start
+    print(f"[rank {rank}] PRM training DONE in {total_elapsed:.1f}s ({total_steps} steps)", flush=True)
+    if is_last and losses:
+        print(f"[rank {rank}] loss avg first {min(8,len(losses))} steps: {sum(losses[:8])/min(8,len(losses)):.4f}", flush=True)
+        print(f"[rank {rank}] loss avg last {min(8,len(losses))} steps:  {sum(losses[-8:])/min(8,len(losses)):.4f}", flush=True)
+
+    if config.save_path:
+        save_reward_stage(rank, config, peft_model, reward_head, config.save_path)
+
+    _teardown(rank)
+    return losses
+
+
+def load_reward_model(rank: int, local_gpu: int, rm_config, checkpoint_dir: str) -> "LoadedRewardModel":
+    """Rebuilds this rank's slice of a previously-trained reward model
+    (an ORM from run_rm_training, or a PRM from run_prm_training used
+    ORM-style via pipeline_score - see LoadedRewardModel) for use as a
+    REAL scorer during PPO/GRPO. This is what makes "end-to-end RLHF"
+    real rather than a rule-based stand-in: the reward signal comes
+    from an actual trained model's forward pass over the network.
+
+    `rm_config` must be the SAME RMConfig/PRMConfig the checkpoint was
+    trained with (model_path/num_layers/world_size/LoRA target_modules
+    etc. all need to match - the same requirement any peft adapter
+    reload has) AND its world_size/rank layout must match the CALLING
+    training run's policy model 1:1 (rank k of both models must live on
+    the same machine) - pipeline_score() below sends/receives against
+    the SAME rank numbering the policy model's own pipeline uses.
+    Kept frozen: every parameter has requires_grad_(False), model in
+    eval() - this is a scorer, never trained further here."""
+    from pathlib import Path
+    from peft import PeftModel
+
+    rank_dir = Path(checkpoint_dir) / f"rank{rank}"
+    peft_model, _, _, _, _, _, hidden_size = build_stage_model(rank, local_gpu, rm_config)
+    # build_stage_model always attaches a FRESH (randomly initialized)
+    # LoRA adapter - discard it and load the ACTUAL trained one from
+    # disk instead. The quantized base weights underneath are identical
+    # either way (same model_path/quantization config), so there's no
+    # need to reload those, only swap the small adapter.
+    base_model = peft_model.base_model.model
+    peft_model = PeftModel.from_pretrained(base_model, str(rank_dir), is_trainable=False)
+    for p in peft_model.parameters():
+        p.requires_grad_(False)
+    peft_model.eval()
+
+    layers = resolve_attr(peft_model.base_model.model, rm_config.layers_attr)
+    my_range = stage_range(rank, rm_config)
+    stage_layers = layers[my_range.start: my_range.stop]
+    embed = resolve_attr(peft_model.base_model.model, rm_config.embed_attr)
+    norm = resolve_attr(peft_model.base_model.model, rm_config.norm_attr)
+    rotary = resolve_attr(peft_model.base_model.model, rm_config.rotary_attr) if rm_config.rotary_attr else None
+
+    reward_head = None
+    head_path = rank_dir / "reward_head.pt"
+    if head_path.exists():
+        reward_head = nn.Linear(hidden_size, 1).to(device=f"cuda:{local_gpu}", dtype=torch.float32)
+        reward_head.load_state_dict(torch.load(head_path, map_location=f"cuda:{local_gpu}"))
+        reward_head.eval()
+        for p in reward_head.parameters():
+            p.requires_grad_(False)
+
+    return LoadedRewardModel(rm_config, stage_layers, embed, norm, rotary, hidden_size, reward_head)
+
+
+@dataclass
+class LoadedRewardModel:
+    """A previously-trained reward model, reloaded (via
+    load_reward_model()) and ready to score during PPO/GRPO through
+    pipeline_score() - see that function and load_reward_model()'s
+    docstring for the world_size/rank-layout requirement."""
+    config: object
+    stage_layers: object
+    embed: object
+    norm: object
+    rotary: object
+    hidden_size: int
+    reward_head: object
+
+
+# ---------------------------------------------------------------------------
 # Shared: pipeline-parallel autoregressive generation
 # ---------------------------------------------------------------------------
 
@@ -396,6 +937,7 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
     rank 0 and on the last stage (the two ranks that actually need it -
     rank 0 to re-embed it in the follow-up teacher-forced training pass,
     the last stage as labels/reward input) - None on any middle rank."""
+    from transformers import AutoConfig
     from transformers.cache_utils import DynamicCache
 
     G = group_size
@@ -412,7 +954,20 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
         dist.recv(len_t, src=0, tag=tag_base)
         prompt_len = len_t.item()
 
-    cache = DynamicCache()
+    # DynamicCache() with NO config builds an empty `self.layers` list
+    # that only grows lazily on a plain KV `.update()` call - fine for a
+    # uniform full-attention model (works on Qwen2.5-0.5B), but a real
+    # crash (`IndexError: list index out of range` inside
+    # `update_conv_state`) on a HYBRID linear/full-attention model
+    # (Qwen3.8-27B): its linear_attention layers directly index
+    # `self.layers[layer_idx]` expecting a pre-built
+    # `LinearAttentionCacheLayerMixin` entry at that GLOBAL index, with
+    # no lazy-grow fallback. Passing `config=` here makes DynamicCache
+    # inspect the model's real per-layer types up front and build the
+    # right cache-layer class for every one of them (found via direct
+    # testing on a real cross-machine GRPO run, not anticipated).
+    hf_config = AutoConfig.from_pretrained(config.model_path)
+    cache = DynamicCache(config=hf_config)
     generated_chunks = []  # rank0 and is_last only; list of (G,) tensors, one per new token
     cur_token = None       # rank0 only: the (G,1) token to embed this call
 
@@ -462,6 +1017,114 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
     return None
 
 
+def pipeline_score(rank, config, stage_layers, embed, norm, rotary, hidden_size, reward_head,
+                    device, is_first, is_last, prev_rank, next_rank, tag,
+                    input_ids: torch.Tensor | None = None) -> torch.Tensor | None:
+    """One real pipeline-parallel forward pass through a FROZEN
+    (no-grad) reward model (see LoadedRewardModel/load_reward_model),
+    pooled at the LAST token position - the real end-to-end reward
+    signal run_ppo_training/run_grpo_training's `rm=` argument uses
+    instead of reward_fn's rule-based text scorer.
+
+    `input_ids` (only meaningful/required on rank 0, same convention as
+    pipeline_generate's `prompt_ids`): (B, T) int64. Pools at position
+    T-1 rather than a response_mask because every caller here passes a
+    FIXED-length, unpadded prompt+completion (pipeline_generate never
+    early-stops or pads mid-batch) - T-1 IS the last real token by
+    construction, no mask needed. Returns (B,) reward on the last
+    stage, None elsewhere."""
+    if is_first:
+        B, T = input_ids.shape
+        len_t = torch.tensor([B, T], dtype=torch.long)
+        for r in range(config.world_size):
+            if r != rank:
+                dist.send(len_t, dst=r, tag=tag)
+    else:
+        len_t = torch.zeros(2, dtype=torch.long)
+        dist.recv(len_t, src=0, tag=tag)
+        B, T = len_t.tolist()
+
+    position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+    with torch.no_grad():
+        if is_first:
+            hidden = embed(input_ids.to(device)).to(config.torch_dtype)
+        else:
+            recv_buf = torch.zeros(B, T, hidden_size, dtype=config.torch_dtype)
+            dist.recv(recv_buf, src=prev_rank, tag=tag)
+            hidden = recv_buf.to(device)
+
+        pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+        out = hidden
+        for layer in stage_layers:
+            out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+
+        if is_last:
+            normed = norm(out)
+            reward_all = reward_head(normed.float()).squeeze(-1)  # (B, T)
+            return reward_all[:, -1].cpu()
+        else:
+            dist.send(out.to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+            return None
+
+
+def pipeline_score_prm(rank, config, stage_layers, embed, norm, rotary, hidden_size, reward_head,
+                        device, is_first, is_last, prev_rank, next_rank, tag,
+                        input_ids: torch.Tensor | None = None,
+                        step_positions: torch.Tensor | None = None) -> torch.Tensor | None:
+    """Same real pipeline-parallel frozen forward pass as
+    pipeline_score(), but reads MULTIPLE per-step positions instead of
+    pooling once at the last token - the natural way to use a trained
+    PRM (run_prm_training) for real scoring: e.g. best-of-N reranking
+    of N candidate solutions by their weakest (minimum) step score,
+    the same use PRM800K/Math-Shepherd's own papers validate PRMs for.
+
+    `input_ids` (B, T) and `step_positions` (B, S) are only
+    meaningful/required on rank 0 - S must be the same across the
+    batch (candidates with different real step counts should pad
+    step_positions with a repeated index and have the caller mask that
+    column out of whatever aggregation it does afterward; kept
+    unpadded/simple here since a real caller usually scores one
+    prompt's N candidates - a shared step-count budget - at a time).
+    Returns (B, S) per-step reward on the last stage, None elsewhere."""
+    if is_first:
+        B, T = input_ids.shape
+        S = step_positions.shape[1]
+        len_t = torch.tensor([B, T, S], dtype=torch.long)
+        for r in range(config.world_size):
+            if r != rank:
+                dist.send(len_t, dst=r, tag=tag)
+                dist.send(step_positions, dst=r, tag=tag)
+    else:
+        len_t = torch.zeros(3, dtype=torch.long)
+        dist.recv(len_t, src=0, tag=tag)
+        B, T, S = len_t.tolist()
+        step_positions = torch.zeros(B, S, dtype=torch.long)
+        dist.recv(step_positions, src=0, tag=tag)
+
+    position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+    with torch.no_grad():
+        if is_first:
+            hidden = embed(input_ids.to(device)).to(config.torch_dtype)
+        else:
+            recv_buf = torch.zeros(B, T, hidden_size, dtype=config.torch_dtype)
+            dist.recv(recv_buf, src=prev_rank, tag=tag)
+            hidden = recv_buf.to(device)
+
+        pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+        out = hidden
+        for layer in stage_layers:
+            out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+
+        if is_last:
+            normed = norm(out)
+            reward_all = reward_head(normed.float()).squeeze(-1)  # (B, T)
+            idx = step_positions.to(device)
+            return reward_all.gather(1, idx).cpu()
+        else:
+            dist.send(out.to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+            return None
+
+
 # ---------------------------------------------------------------------------
 # GRPO
 # ---------------------------------------------------------------------------
@@ -500,7 +1163,13 @@ def build_grpo_prompts(tokenizer, config: GRPOConfig) -> list[torch.Tensor]:
 
 
 def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id: str = "grpo_pipeline",
-                       reward_fn=default_reward_fn) -> list[float]:
+                       reward_fn=default_reward_fn, rm: "LoadedRewardModel | None" = None) -> list[float]:
+    """`rm`, when given (see load_reward_model()), scores each rollout
+    with a REAL trained reward model via pipeline_score() - a genuine
+    pipeline-parallel forward pass every rank participates in - instead
+    of reward_fn's rule-based text heuristic. This is the real
+    end-to-end RLHF path: SFT -> run_rm_training -> load_reward_model
+    -> this. `reward_fn` is ignored when `rm` is set."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -514,6 +1183,13 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
     next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    # See run_dpo_training's identical barrier for why: without this, a
+    # fast-loading rank can start sending real tensors before a
+    # slow-loading rank finishes, and the QUIC connection's own idle
+    # timeout closes it before the slow rank ever gets there.
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
 
     trainable = [p for p in peft_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
@@ -532,10 +1208,28 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
 
     for epoch in range(config.epochs):
         for prompt_ids in prompts:
+            # See run_dpo_training's identical per-step barrier for why:
+            # a real cross-machine 27B run hit exactly this - one rank
+            # reaching this step's generation recv before another rank
+            # finished the previous step's bookkeeping, idle-timing-out
+            # the underlying QUIC connection. Uses _step_barrier, NOT
+            # dist.barrier() - see that function's docstring for why a
+            # second dist.barrier() call is a silent no-op (this was the
+            # actual root cause of the real timeout observed here, not
+            # just a plausible-sounding guess - a first attempt using
+            # plain dist.barrier() here did NOT fix the crash).
+            _step_barrier(signaling_url, config, f"grpo_{step_counter + 1}")
             step_counter += 1
             tag_gen = (step_counter % 4) * 3
             tag_ref = tag_gen + 1
             tag_policy = tag_gen + 2
+            # Deliberately far outside the tag_gen/tag_ref/tag_policy
+            # range above rather than folded into that formula's own
+            # modulo width - this is an EXISTING, already cross-machine-
+            # validated tag scheme (see project memory); a fixed,
+            # clearly-separated offset adds the one new tag pipeline_score
+            # needs without touching arithmetic that already works.
+            tag_rm = 1000 + (step_counter % 8)
 
             # --- 1. rollout: sample G completions from the CURRENT policy ---
             peft_model.eval()
@@ -555,10 +1249,24 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
 
             # --- 2. reward + group-relative advantage (last stage only; no
             # critic - the group mean/std IS the baseline, the defining
-            # trick that lets GRPO drop PPO's value network) ---
-            if is_last:
+            # trick that lets GRPO drop PPO's value network). Two reward
+            # sources: `rm` (a REAL trained reward model, scored via a
+            # genuine pipeline-parallel round trip EVERY rank must
+            # participate in - see pipeline_score()) when given, else the
+            # default rule-based reward_fn (text-only, is_last alone). ---
+            if rm is not None:
+                rm_input = full_ids.cpu() if is_first else None
+                rm_reward = pipeline_score(
+                    rank, rm.config, rm.stage_layers, rm.embed, rm.norm, rm.rotary, rm.hidden_size, rm.reward_head,
+                    device, is_first, is_last, prev_rank, next_rank, tag_rm, input_ids=rm_input,
+                )
+                if is_last:
+                    rewards = rm_reward
+            elif is_last:
                 texts = [tokenizer.decode(generated[g], skip_special_tokens=True) for g in range(G)]
                 rewards = torch.tensor([reward_fn(t) for t in texts], dtype=torch.float32)
+
+            if is_last:
                 advantage = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
                 rewards_log.append(rewards.mean().item())
 
@@ -715,7 +1423,12 @@ def _gae(rewards: torch.Tensor, values: torch.Tensor, gamma: float, lam: float):
 
 
 def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: str = "ppo_pipeline",
-                      reward_fn=default_reward_fn) -> list[float]:
+                      reward_fn=default_reward_fn, rm: "LoadedRewardModel | None" = None) -> list[float]:
+    """`rm`, when given (see load_reward_model()), scores each rollout
+    with a REAL trained reward model via pipeline_score() instead of
+    reward_fn's rule-based text heuristic - see run_grpo_training's
+    identical `rm` parameter docstring. `reward_fn` is ignored when
+    `rm` is set."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -729,6 +1442,10 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
     next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    # See run_dpo_training's identical barrier for why.
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
 
     trainable = [p for p in peft_model.parameters() if p.requires_grad]
     # Value head lives ONLY on the last stage, right next to lm_head - it
@@ -755,10 +1472,19 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
 
     for epoch in range(config.epochs):
         for prompt_ids in prompts:
+            # See run_dpo_training's/run_grpo_training's identical
+            # per-step barrier for why this is _step_barrier and NOT
+            # plain dist.barrier() (which is a silent no-op past the
+            # first call in a process group's lifetime).
+            _step_barrier(signaling_url, config, f"ppo_{step_counter + 1}")
             step_counter += 1
             tag_gen = (step_counter % 3) * (2 + config.ppo_epochs)
             tag_ref = tag_gen + 1
             tag_old = tag_gen + 2
+            # Same deliberately-far-outside-the-existing-scheme choice
+            # as run_grpo_training's tag_rm - see that function's
+            # comment for why this isn't folded into the formula above.
+            tag_rm = 1000 + (step_counter % 8)
 
             # --- 1. rollout: sample G completions from the CURRENT policy ---
             peft_model.eval()
@@ -776,6 +1502,19 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
 
             if is_first:
                 full_ids = torch.cat([prompt_ids.expand(G, -1), generated], dim=1).to(device)
+
+            # If `rm` is given, score the rollout with a REAL trained
+            # reward model NOW via a genuine pipeline-parallel round
+            # trip - every rank must participate (see pipeline_score()),
+            # so this happens unconditionally, not inside `if is_last`.
+            # The rule-based reward_fn path (below, is_last only) is
+            # unchanged when rm is None.
+            if rm is not None:
+                rm_input = full_ids.cpu() if is_first else None
+                rm_reward_out = pipeline_score(
+                    rank, rm.config, rm.stage_layers, rm.embed, rm.norm, rm.rotary, rm.hidden_size, rm.reward_head,
+                    device, is_first, is_last, prev_rank, next_rank, tag_rm, input_ids=rm_input,
+                )
 
             def forced_forward(tag, no_grad, want_value):
                 """Returns (logits_or_out, value_or_None, hidden_in) on
@@ -817,8 +1556,11 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
                 logp_ref = F.log_softmax(ref_out[:, resp_start:, :].float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
                 logp_old = F.log_softmax(old_out[:, resp_start:, :].float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
 
-                texts = [tokenizer.decode(generated[g], skip_special_tokens=True) for g in range(G)]
-                env_reward = torch.tensor([reward_fn(t) for t in texts], dtype=torch.float32, device=device)
+                if rm is not None:
+                    env_reward = rm_reward_out.to(device)
+                else:
+                    texts = [tokenizer.decode(generated[g], skip_special_tokens=True) for g in range(G)]
+                    env_reward = torch.tensor([reward_fn(t) for t in texts], dtype=torch.float32, device=device)
                 rewards_log.append(env_reward.mean().item())
 
                 # Per-token reward = KL-to-reference penalty everywhere,

@@ -1,0 +1,37 @@
+# Reward model (RM) training on Qwen2.5-0.5B, same 2-stage pipeline
+# topology as qwen25_0.5b_dpo.yaml. Bradley-Terry pairwise loss on the
+# SAME preference dataset/fields DPO uses (build_dpo_dataset is reused
+# directly, unchanged - see rlhf.py's RM section docstring). The saved
+# checkpoint is meant to be fed into ppo_pipeline_rank.py's/
+# grpo_pipeline_rank.py's optional rm_config/rm_checkpoint_dir args for
+# real end-to-end RLHF (SFT -> RM -> PPO/GRPO).
+#
+# Run: python3 rm_pipeline_rank.py configs/qwen25_0.5b_rm.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16   # matches this model's native dtype, same as qwen25_0.5b_lora.yaml
+
+dataset_name: Intel/orca_dpo_pairs
+dataset_split: train
+num_examples: 32
+prompt_field: question
+chosen_field: chosen
+rejected_field: rejected
+
+max_prompt_len: 64
+max_response_len: 64
+reward_l2_coef: 0.001
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 4
+
+save_path: /kaggle/working/rm_checkpoints/qwen25_0.5b

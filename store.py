@@ -68,6 +68,29 @@ class QuicRendezvousStore(dist.Store):
     # that matters for rendezvous/barrier is expressed in terms of these
     # four, matching `_store_based_barrier`'s own usage exactly. ----
 
+    def _request_with_retry(self, request_fn, deadline: float):
+        """Runs `request_fn()` (a zero-arg call performing ONE HTTP
+        request), retrying on transient network failures (timeout,
+        connection reset/refused) until `deadline` (a
+        `time.monotonic()` value). A real, observed failure mode over a
+        zrok tunnel under concurrent multi-rank load - `add()` used to
+        make exactly one `requests.post(..., timeout=10)` call with NO
+        retry at all, and a real `dist.barrier()` call (this store's
+        first real exerciser of `_store_based_barrier`'s `add()` usage)
+        hit a bare `ReadTimeoutError` from that single call and crashed
+        the whole rank, even though every other network hiccup in this
+        class was already survivable via its own polling loop. HTTP
+        status errors (4xx/5xx, via `raise_for_status()`) are NOT
+        retried here - only request-level failures that mean no
+        response was received at all."""
+        while True:
+            try:
+                return request_fn()
+            except requests.exceptions.RequestException:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(_DEFAULT_POLL_INTERVAL_S)
+
     def set(self, key: str, value: bytes | str) -> None:
         # torch's own internals (e.g. _store_based_barrier's
         # `store.set(last_worker_key, "1")`) call this with a plain str,
@@ -77,10 +100,14 @@ class QuicRendezvousStore(dist.Store):
         # coercion itself, there's no default to inherit it from.
         if isinstance(value, str):
             value = value.encode("utf-8")
-        resp = requests.post(
-            f"{self._signaling_url}/kv/set",
-            json={"key": key, "value": _b64encode(value)},
-            timeout=10,
+        deadline = time.monotonic() + self._timeout.total_seconds()
+        resp = self._request_with_retry(
+            lambda: requests.post(
+                f"{self._signaling_url}/kv/set",
+                json={"key": key, "value": _b64encode(value)},
+                timeout=10,
+            ),
+            deadline,
         )
         resp.raise_for_status()
 
@@ -94,7 +121,10 @@ class QuicRendezvousStore(dist.Store):
         # `TCPStore`/`HashStore` actually observe.
         deadline = time.monotonic() + self._timeout.total_seconds()
         while True:
-            resp = requests.get(f"{self._signaling_url}/kv/get", params={"key": key}, timeout=10)
+            resp = self._request_with_retry(
+                lambda: requests.get(f"{self._signaling_url}/kv/get", params={"key": key}, timeout=10),
+                deadline,
+            )
             if resp.status_code == 200:
                 return _b64decode(resp.json()["value"])
             if resp.status_code != 404:
@@ -104,10 +134,14 @@ class QuicRendezvousStore(dist.Store):
             time.sleep(_DEFAULT_POLL_INTERVAL_S)
 
     def add(self, key: str, value: int) -> int:
-        resp = requests.post(
-            f"{self._signaling_url}/kv/add",
-            json={"key": key, "amount": value},
-            timeout=10,
+        deadline = time.monotonic() + self._timeout.total_seconds()
+        resp = self._request_with_retry(
+            lambda: requests.post(
+                f"{self._signaling_url}/kv/add",
+                json={"key": key, "amount": value},
+                timeout=10,
+            ),
+            deadline,
         )
         resp.raise_for_status()
         return int(resp.json()["value"])
@@ -117,10 +151,14 @@ class QuicRendezvousStore(dist.Store):
             expected = expected.encode("utf-8")
         if isinstance(desired, str):
             desired = desired.encode("utf-8")
-        resp = requests.post(
-            f"{self._signaling_url}/kv/compare_set",
-            json={"key": key, "expected": _b64encode(expected), "desired": _b64encode(desired)},
-            timeout=10,
+        deadline = time.monotonic() + self._timeout.total_seconds()
+        resp = self._request_with_retry(
+            lambda: requests.post(
+                f"{self._signaling_url}/kv/compare_set",
+                json={"key": key, "expected": _b64encode(expected), "desired": _b64encode(desired)},
+                timeout=10,
+            ),
+            deadline,
         )
         resp.raise_for_status()
         return _b64decode(resp.json()["value"])
@@ -137,7 +175,10 @@ class QuicRendezvousStore(dist.Store):
         while remaining:
             still_missing = set()
             for key in remaining:
-                resp = requests.get(f"{self._signaling_url}/kv/get", params={"key": key}, timeout=10)
+                resp = self._request_with_retry(
+                    lambda k=key: requests.get(f"{self._signaling_url}/kv/get", params={"key": k}, timeout=10),
+                    deadline,
+                )
                 if resp.status_code != 200:
                     still_missing.add(key)
             remaining = still_missing
@@ -151,15 +192,26 @@ class QuicRendezvousStore(dist.Store):
             time.sleep(_DEFAULT_POLL_INTERVAL_S)
 
     def delete_key(self, key: str) -> bool:
-        resp = requests.delete(f"{self._signaling_url}/kv", params={"key": key}, timeout=10)
+        deadline = time.monotonic() + self._timeout.total_seconds()
+        resp = self._request_with_retry(
+            lambda: requests.delete(f"{self._signaling_url}/kv", params={"key": key}, timeout=10),
+            deadline,
+        )
         resp.raise_for_status()
         return True
 
     def check(self, keys: list[str]) -> bool:
         """Non-blocking `wait` - `True` iff every key is already present
-        right now, without polling/retrying."""
+        right now, without polling/retrying FOR KEY PRESENCE (a
+        transient network failure on the underlying HTTP call still
+        gets the same short retry as everywhere else in this class -
+        that's a transport hiccup, not a "key not present yet" answer)."""
+        deadline = time.monotonic() + self._timeout.total_seconds()
         for key in keys:
-            resp = requests.get(f"{self._signaling_url}/kv/get", params={"key": key}, timeout=10)
+            resp = self._request_with_retry(
+                lambda k=key: requests.get(f"{self._signaling_url}/kv/get", params={"key": k}, timeout=10),
+                deadline,
+            )
             if resp.status_code != 200:
                 return False
         return True

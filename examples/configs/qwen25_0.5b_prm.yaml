@@ -1,0 +1,36 @@
+# Process reward model (PRM) training on Qwen2.5-0.5B, same 2-stage
+# pipeline topology as qwen25_0.5b_rm.yaml. Trains on real
+# peiyi9979/Math-Shepherd data (GSM8K solutions with per-step +/-
+# correctness labels already applied to the `label` field - confirmed
+# by loading the dataset directly, see rlhf.py's PRM section
+# docstring) with per-step binary cross-entropy. One example per
+# pipeline step (batch=1 - see build_prm_dataset's docstring for why),
+# so num_examples below IS the step count directly (no batch division).
+#
+# Run: python3 prm_pipeline_rank.py configs/qwen25_0.5b_prm.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16   # matches this model's native dtype, same as qwen25_0.5b_lora.yaml
+
+dataset_name: peiyi9979/Math-Shepherd
+dataset_split: train
+num_examples: 64
+label_field: label
+step_positive_marker: "+"
+step_negative_marker: "-"
+
+max_len: 256
+max_steps: 8
+epochs: 1
+lr: 0.0001
+log_every: 4
+
+save_path: /kaggle/working/rm_checkpoints/qwen25_0.5b_prm

@@ -104,10 +104,24 @@ class PipelineConfig:
     # yourself and call run_pipeline_training's lower-level pieces
     # directly instead (build_stage_model + the loop body) rather than
     # forcing a mismatched dataset spec through build_dataset().
+    #
+    # training_mode: "cpt" (default, unchanged from this module's
+    # original behavior) trains on the WHOLE `text_field` blob as plain
+    # next-token continuation, no masking - genuine continued
+    # pre-training semantics (raw domain text, every token supervises
+    # the loss). "sft" additionally masks the loss to ONLY the response
+    # region (set `prompt_field`/`response_field` instead of
+    # `text_field`) - real instruction-tuning semantics, mirroring
+    # rlhf.py's DPO dataset's token-boundary approach (tokenize prompt
+    # and response SEPARATELY then concatenate ids, so the boundary is
+    # exact in token space, not string space).
+    training_mode: str = "cpt"
     dataset_name: str = "tatsu-lab/alpaca"
     dataset_split: str = "train"
     num_examples: int | None = 64
     text_field: str = "text"
+    prompt_field: str = "instruction"
+    response_field: str = "output"
 
     # Training
     seq_len: int = 96
@@ -137,6 +151,27 @@ def resolve_attr(obj, dotted_path: str):
     for part in dotted_path.split("."):
         obj = getattr(obj, part)
     return obj
+
+
+def _step_barrier(signaling_url, config, tag: str, timeout_s: int = 300):
+    """A REAL per-step barrier - unlike `dist.barrier()`, which is only
+    safe to call ONCE per process group's lifetime. Found via a real
+    cross-machine GRPO run (see quic_dist/rlhf.py's identical helper,
+    which this mirrors): PyTorch's own `_store_based_barrier` keys its
+    store entry ONLY by the process group's name, not by call site or
+    call count, so a second `dist.barrier()` call in the same process
+    group reads the already-satisfied key from the FIRST call and
+    returns immediately - a silent no-op. Reimplements the same
+    add-then-wait-for-last-worker pattern directly against the store,
+    with a fresh key per `tag` so each call is genuinely independent."""
+    from quic_dist.store import QuicRendezvousStore
+
+    store = QuicRendezvousStore(signaling_url, timeout=timedelta(seconds=timeout_s))
+    key = f"step_barrier_{tag}"
+    count = store.add(key, 1)
+    if count == config.world_size:
+        store.set(f"{key}:done", "1")
+    store.wait([f"{key}:done"])
 
 
 def stage_range(rank: int, config: PipelineConfig) -> range:
@@ -247,19 +282,47 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
     return peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
-def build_dataset(tokenizer, config: PipelineConfig) -> torch.Tensor:
+def build_dataset(tokenizer, config: PipelineConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (input_ids, response_mask), each (n_batches, batch,
+    block). In "cpt" mode response_mask is all-ones (every token
+    supervises the loss, matching this function's original behavior
+    exactly). In "sft" mode response_mask is 1 only over the response
+    region - computed in TOKEN space (prompt and response tokenized
+    SEPARATELY then concatenated), not by string-matching a rendered
+    prompt+response, so the boundary is exact."""
     from datasets import load_dataset
 
     split = config.dataset_split if config.num_examples is None else f"{config.dataset_split}[:{config.num_examples}]"
     ds = load_dataset(config.dataset_name, split=split)
     block = config.seq_len + 1
-    all_ids = [
-        tokenizer(ex[config.text_field], truncation=True, max_length=block, padding="max_length")["input_ids"]
-        for ex in ds
-    ]
+    pad_id = tokenizer.pad_token_id
+
+    all_ids = []
+    all_mask = []
+    if config.training_mode == "sft":
+        for ex in ds:
+            prompt_ids = tokenizer(ex[config.prompt_field], truncation=True, max_length=block, add_special_tokens=True)["input_ids"]
+            response_ids = tokenizer(ex[config.response_field], truncation=True, max_length=block, add_special_tokens=False)["input_ids"]
+            ids = (prompt_ids + response_ids)[:block]
+            mask = ([0] * len(prompt_ids) + [1] * len(response_ids))[:block]
+            pad = block - len(ids)
+            if pad > 0:
+                ids = ids + [pad_id] * pad
+                mask = mask + [0] * pad
+            all_ids.append(ids)
+            all_mask.append(mask)
+    else:
+        for ex in ds:
+            ids = tokenizer(ex[config.text_field], truncation=True, max_length=block, padding="max_length")["input_ids"]
+            all_ids.append(ids)
+            all_mask.append([1] * block)
+
     ids_t = torch.tensor(all_ids, dtype=torch.long)
+    mask_t = torch.tensor(all_mask, dtype=torch.long)
     n_batches = ids_t.shape[0] // config.batch
-    return ids_t[: n_batches * config.batch].view(n_batches, config.batch, block)
+    ids_t = ids_t[: n_batches * config.batch].view(n_batches, config.batch, block)
+    mask_t = mask_t[: n_batches * config.batch].view(n_batches, config.batch, block)
+    return ids_t, mask_t
 
 
 def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig, job_id: str = "pipeline_finetune", local_gpu: int | None = None) -> list[float]:
@@ -289,10 +352,21 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
 
     peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config)
+
+    # Real bug found via a cross-machine 27B DPO run (rlhf.py): model
+    # loading takes very different real wall-clock time per rank (disk
+    # speed, machine load) - without a barrier here, a fast-loading rank
+    # can reach the training loop and start sending real tensors while a
+    # slow-loading rank is still mid-load, and the underlying QUIC
+    # connection's own idle timeout closes the connection before the
+    # slow rank ever gets there.
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
+
     trainable = [p for p in peft_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
-    batches = build_dataset(tokenizer, config)
+    batches, response_masks = build_dataset(tokenizer, config)
     n_steps = batches.shape[0]
     total_steps = n_steps * config.epochs
     print(f"[rank {rank}] {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps", flush=True)
@@ -303,9 +377,19 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
 
     for epoch in range(config.epochs):
         for b in range(n_steps):
+            # See rlhf.py's run_dpo_training's identical per-step
+            # barrier for why: a rank finishing a step faster than
+            # another can leave the slower rank's connection idle long
+            # enough for the underlying QUIC connection's own idle
+            # timeout to fire before the next step's first send/recv.
+            # Uses _step_barrier, NOT dist.barrier() - see that
+            # function's docstring for why a second dist.barrier() call
+            # is a silent no-op.
+            _step_barrier(signaling_url, config, f"sft_{epoch}_{b}")
             tag = step_counter % 8
             step_counter += 1
             block = batches[b]
+            mask = response_masks[b]
             optimizer.zero_grad()
             position_ids = torch.arange(config.seq_len, device=device).unsqueeze(0).expand(config.batch, -1)
 
@@ -329,6 +413,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
 
             if is_last:
                 labels = block[:, 1:].to(device)
+                resp_mask = mask[:, 1:].to(device).float()
                 out = norm(out)
                 # Symmetric to the embed_tokens cast above: lm_head is
                 # also left unquantized/uncast by bitsandbytes by
@@ -336,7 +421,17 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
                 # weight dtype right here rather than forcing lm_head
                 # itself into config.torch_dtype.
                 logits = lm_head(out.to(lm_head.weight.dtype))
-                loss = nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), labels.reshape(-1))
+                # "cpt" mode's mask is all-ones, so this is exactly the
+                # original unmasked mean cross-entropy - unchanged
+                # behavior for every existing validated config. "sft"
+                # mode's mask zeroes out prompt/pad positions, so only
+                # response tokens contribute - a real masked mean, not
+                # just zeroing the loss AFTER an unmasked mean (that
+                # would still be wrong-denominator).
+                per_token = nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]).float(), labels.reshape(-1), reduction="none"
+                ).reshape(resp_mask.shape)
+                loss = (per_token * resp_mask).sum() / resp_mask.sum().clamp(min=1)
                 loss.backward()
                 losses.append(loss.item())
             else:

@@ -1,0 +1,37 @@
+# Same model/topology as qwen25_0.5b_lora.yaml's real, validated
+# cross-machine proof - this config exercises finetune.py's OTHER
+# training_mode ("sft" instead of the default "cpt"): loss is masked to
+# only the response region (prompt_field/response_field tokenized
+# SEPARATELY then concatenated, exact token-space boundary - see
+# finetune.py's PipelineConfig docstring). tatsu-lab/alpaca already has
+# real instruction/output fields matching the defaults.
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen25_0.5b_sft.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24  # Qwen2.5-0.5B has 24 decoder layers
+
+# layers_attr/embed_attr/norm_attr/lm_head_attr/rotary_attr all keep
+# their defaults - a plain AutoModelForCausalLM nests at model.layers,
+# model.embed_tokens, model.norm, model.rotary_emb, lm_head.
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"   # set to "none" for plain LoRA, "8bit" for int8
+compute_dtype: float16 # matches this model's native dtype - see finetune.py's
+                        # docstring on why this must match, not just "a reasonable choice"
+
+training_mode: sft
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 256
+prompt_field: instruction
+response_field: output
+
+seq_len: 128
+batch: 4
+epochs: 1
+lr: 0.0001

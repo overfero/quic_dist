@@ -12,15 +12,17 @@ world_size: 4
 num_layers: 64
 
 # AutoModelForCausalLM.from_pretrained resolves this config to
-# Qwen3_5ForCausalLM (text-only, no vision tower) - but ONE level
-# deeper than a plain CausalLM: model.model.layers, not model.layers.
-# Confirmed via a meta-device skeleton inspection, not assumed - see
-# qwen38_27b_pipeline_rank.py's module docstring.
-layers_attr: model.model.layers
-embed_attr: model.model.embed_tokens
-norm_attr: model.model.norm
-rotary_attr: model.model.rotary_emb
-lm_head_attr: model.lm_head
+# Qwen3_5ForCausalLM (text-only, no vision tower). Originally this
+# needed model.model.layers (one level deeper than a plain CausalLM,
+# confirmed via a meta-device skeleton inspection at the time). RE-
+# VERIFIED empirically (2026-08-23, a later session window) against the
+# currently-installed transformers>=5.15: that extra nesting is GONE -
+# top level is now ['model', 'lm_head'], and .model directly has
+# embed_tokens/layers/norm/rotary_emb. Left at PLAIN defaults below -
+# don't re-add the model.model.* prefix without re-checking against
+# whatever transformers version is actually installed (this library's
+# internal structure for a very recently added architecture can and did
+# change between versions).
 
 # Uneven split - rank3 (last stage) carries lm_head (5120 x 248320,
 # unquantized) + norm on top of whatever decoder layers it holds, at

@@ -1,0 +1,53 @@
+# DPO on the same real 4-stage/2-machine/4-GPU topology as
+# qwen38_27b_qlora.yaml (the validated SFT proof: loss 0.6973 -> 0.2734
+# over 3 epochs, 1068.9s). Structurally closest of the three RLHF modes
+# to that proof - no generation loop, just 2 forward(+backward) passes
+# per step, same shape as SFT's single pass - so this is the first of
+# the three attempted at 27B scale, before GRPO/PPO's real pipeline
+# generation is attempted cross-machine.
+#
+# block = max_prompt_len + max_response_len = 48, matching the SFT
+# proof's SEQ_LEN=48 (reduced from 96 there after a real CUDA OOM - the
+# linear-attention blocks run a slow, memory-hungry pure-PyTorch
+# reference kernel with no fused causal_conv1d/fla package installed).
+#
+# layers_attr etc left at their PLAIN defaults (model.layers, not
+# model.model.layers) - a real regression found via direct empirical
+# re-inspection (accelerate.init_empty_weights() skeleton): the earlier
+# double-nesting finding no longer holds on transformers>=5.15's current
+# Qwen3_5ForCausalLM - top level is ['model', 'lm_head'], and .model
+# (Qwen3_5TextModel) directly has embed_tokens/layers/norm/rotary_emb,
+# no extra nesting. The old qwen38_27b_qlora.yaml's model.model.* /
+# model.lm_head values are now STALE - don't copy them without
+# re-verifying against the currently-installed transformers version.
+#
+# Run: python3 dpo_pipeline_rank.py configs/qwen38_27b_dpo.yaml <rank> <signaling_url>
+
+model_path: /models/qwen38_27b
+world_size: 4
+num_layers: 64
+stage_layer_counts: [17, 17, 18, 12]
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [gate_proj, up_proj]
+
+quantization: "4bit"
+compute_dtype: bfloat16
+cpu_offload_unused_layers: true
+connect_timeout_s: 1800
+
+beta: 0.1
+dataset_name: Intel/orca_dpo_pairs
+dataset_split: train
+num_examples: 8
+prompt_field: question
+chosen_field: chosen
+rejected_field: rejected
+
+max_prompt_len: 24
+max_response_len: 24
+batch: 1
+epochs: 3
+lr: 0.0001
+log_every: 2

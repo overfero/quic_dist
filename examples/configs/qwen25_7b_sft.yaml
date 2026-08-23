@@ -1,0 +1,32 @@
+# SFT on Qwen2.5-7B, real 2-machine cross-machine (world_size=2, one
+# rank per machine) - same topology as qwen25_7b_ppo.yaml's already-
+# confirmed real cross-machine run. Masked loss to the response region
+# only (see finetune.py's PipelineConfig docstring on training_mode).
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen25_7b_sft.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-7B
+world_size: 2
+num_layers: 28
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: bfloat16
+cpu_offload_unused_layers: true
+connect_timeout_s: 1800
+
+training_mode: sft
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 32
+prompt_field: instruction
+response_field: output
+
+seq_len: 96
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 4

@@ -1,0 +1,43 @@
+# PPO on Qwen2.5-7B, real 2-machine cross-machine (world_size=2, one
+# rank per machine - same topology as qwen25_0.5b_ppo.yaml's already-
+# confirmed real cross-machine run, just a real ~14x larger model).
+# Deliberately a STANDARD Qwen2ForCausalLM (plain full-attention, no
+# linear_attention/hybrid blocks at all) - this is the whole point: it
+# isolates whether the 27B PPO slowness (see project memory) was about
+# scale in general, or specific to Qwen3.8-27B's hybrid architecture +
+# fla/quantization interaction. If this completes in reasonable time,
+# that confirms the latter.
+#
+# Run: python3 ppo_pipeline_rank.py configs/qwen25_7b_ppo.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-7B
+world_size: 2
+num_layers: 28
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: bfloat16
+cpu_offload_unused_layers: true
+connect_timeout_s: 1800
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 8
+prompt_field: instruction
+max_prompt_len: 24
+
+group_size: 2
+max_new_tokens: 8
+temperature: 1.0
+kl_coef: 0.05
+gamma: 1.0
+gae_lambda: 0.95
+clip_eps: 0.2
+vf_coef: 0.5
+ppo_epochs: 2
+epochs: 2
+lr: 0.0001
+log_every: 1

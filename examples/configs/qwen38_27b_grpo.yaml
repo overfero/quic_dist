@@ -1,0 +1,44 @@
+# GRPO on the same real 4-stage/2-machine/4-GPU topology as
+# qwen38_27b_qlora.yaml/qwen38_27b_dpo.yaml. Real risk here that DPO
+# doesn't have: pipeline_generate() does ONE FULL 4-STAGE ROUND TRIP
+# (crossing the real akun1<->akun5 link once) PER NEW TOKEN, and this
+# model's linear-attention blocks are slow (no fused causal_conv1d/fla
+# kernel installed - see the SFT proof's history). Kept deliberately
+# small (group_size=2, max_new_tokens=6, num_examples=4) to keep total
+# wall-clock reasonable for a first real cross-machine attempt - scale
+# up only after this runs clean.
+#
+# Run: python3 grpo_pipeline_rank.py configs/qwen38_27b_grpo.yaml <rank> <signaling_url>
+
+model_path: /models/qwen38_27b
+world_size: 4
+num_layers: 64
+stage_layer_counts: [17, 17, 18, 12]
+
+# layers_attr etc left at their PLAIN defaults (model.layers) - see
+# qwen38_27b_dpo.yaml's comment: the old model.model.* nesting no longer
+# matches transformers>=5.15's current Qwen3_5ForCausalLM structure,
+# reconfirmed via direct empirical inspection, not copied from memory.
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [gate_proj, up_proj]
+
+quantization: "4bit"
+compute_dtype: bfloat16
+cpu_offload_unused_layers: true
+connect_timeout_s: 1800
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 4
+prompt_field: instruction
+max_prompt_len: 16
+
+group_size: 2
+max_new_tokens: 6
+temperature: 1.0
+kl_coef: 0.05
+epochs: 3
+lr: 0.0001
+log_every: 1

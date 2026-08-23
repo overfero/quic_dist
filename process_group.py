@@ -93,7 +93,6 @@ from quic_dist.holepunch import peer as _hp  # noqa: E402  (vendored copy - hole
 
 _SIGNALING_URL_ENV = "QUIC_DIST_SIGNALING_URL"
 _FALLBACK_WINDOW_BYTES = 1024 * 1024
-_DEFAULT_IDLE_TIMEOUT_S = 45.0
 _DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024 * 1024
 _NO_TIMEOUT_MS = 2**31 - 1
 _DRAIN_TIMEOUT_MS = 3000
@@ -445,7 +444,23 @@ class ProcessGroupQUIC(dist.ProcessGroup):
             # instead of another blind step along the same failure mode
             # &sect;7's binary search already mapped out for a single stream.
             flow_window = max(8 * window, _NUM_PARALLEL_STREAMS * stream_window)
-            idle_timeout_ms = max(1, int(_DEFAULT_IDLE_TIMEOUT_S * 1000))
+            # Real bug found via a cross-machine 27B PPO run: this was
+            # hardcoded to a fixed 45s, regardless of the `timeout=` a
+            # caller passes to init_process_group -
+            # completely disconnected from handshake_timeout_ms right
+            # below, which DOES already respect it. A slow model's real
+            # per-token forward pass (this hybrid-attention 27B model's
+            # linear-attention blocks run an uncompiled pure-PyTorch
+            # reference kernel, no fused causal_conv1d/fla installed - see
+            # finetune.py's history) can genuinely leave a connection idle
+            # longer than 45s between messages with nothing wrong -
+            # raising connect_timeout_s in a config did NOT help before
+            # this fix, because it only ever fed handshake_timeout_ms and
+            # the app-level retry-loop deadlines, never the QUIC
+            # connection's own protocol-level max_idle_timeout. Now tied
+            # to the same self._timeout every other operation in this
+            # class already uses, instead of a second, independent knob.
+            idle_timeout_ms = max(1, int(self._timeout.total_seconds() * 1000))
             handshake_timeout_ms = max(1, int(self._timeout.total_seconds() * 1000))
 
             try:
