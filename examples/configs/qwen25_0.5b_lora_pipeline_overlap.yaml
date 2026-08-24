@@ -1,0 +1,56 @@
+# Same model/topology as qwen25_0.5b_lora.yaml, with
+# pipeline_overlap_microbatches enabled - the actual fix for
+# overlap_communication's documented ceiling (see README.md's training
+# infrastructure checklist: that flag's own per-micro-batch
+# _step_barrier reabsorbs most of the overlap it creates). This one
+# removes that barrier and runs a real GPipe-style schedule per
+# accumulation window (all forwards, then all backwards, then one
+# optimizer.step()) - requires grad_accum_steps > 1 to do anything.
+#
+# Real bug found and fixed while validating this (not just written and
+# assumed correct): a direct hang on the LAST window of a real run,
+# root-caused to tag reuse across windows colliding in the Rust
+# engine's per-tag persistent channel (see run_gpipe_window's
+# docstring in finetune.py) - fixed by making tags globally unique per
+# (direction, micro-batch) instead of the per-micro-batch loop's
+# step_counter % 8 rotation, which is only safe for that loop's
+# strictly-sequential-per-tag usage, not this one's overlapping usage.
+#
+# Honest, validated results (loopback AND real cross-machine, local <->
+# a real remote GCP box, grad_accum_steps=8 loopback / 4 cross-machine):
+# correctness held both times - loss bit-identical to the non-overlap
+# path at every matching step. Timing: loopback 33.1s -> ~23-25s across
+# 3 repeated runs (~28% faster), cross-machine 39.9s -> 18.7s (~53%
+# faster, more than 2x) - bigger cross-machine as expected, since real
+# network latency is exactly what this schedule hides behind compute.
+#
+# Real cost: peak activation memory scales with grad_accum_steps (every
+# micro-batch's activation in the window stays alive until its backward
+# runs, not just one at a time) - a real trade-off, not free.
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen25_0.5b_lora_pipeline_overlap.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 64
+text_field: text
+
+seq_len: 128
+batch: 1
+epochs: 1
+lr: 0.0001
+log_every: 1
+
+grad_accum_steps: 8
+pipeline_overlap_microbatches: true

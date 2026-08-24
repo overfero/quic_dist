@@ -171,6 +171,33 @@ class PipelineConfig:
     # teardown. False (default) = unchanged blocking `send` behavior.
     overlap_communication: bool = False
 
+    # Real multi-micro-batch pipeline overlap - the actual fix for
+    # overlap_communication's own documented ceiling (its README entry
+    # explains why: the per-micro-batch _step_barrier forces every rank
+    # back into lockstep every step, so there's only ever ONE
+    # micro-batch's communication to overlap with, and it gets
+    # reabsorbed by the very next barrier). This flag removes that
+    # per-micro-batch barrier and instead runs a real GPipe-style
+    # schedule PER ACCUMULATION WINDOW (grad_accum_steps micro-batches):
+    # first ALL forwards for the window (each non-last rank's send is
+    # async via isend, and the NEXT micro-batch's incoming activation is
+    # prefetched via irecv while the current one is still computing),
+    # THEN all backwards for the window, THEN one optimizer.step(). Only
+    # ONE _step_barrier per WINDOW (not per micro-batch) - still
+    # protects against the original idle-timeout problem (a real gap
+    # can still occur between windows, e.g. around checkpoint/eval), but
+    # no longer serializes every single micro-batch.
+    #
+    # Real cost, not free: every micro-batch's activation
+    # (`out`/`hidden_in`) in the window must stay alive in GPU memory
+    # until ITS backward runs, not just one at a time - peak activation
+    # memory scales with grad_accum_steps. Requires grad_accum_steps > 1
+    # to do anything (with 1, a "window" is a single micro-batch and
+    # this degenerates to the same shape as overlap_communication with
+    # no barrier - harmless but pointless). False (default) = the
+    # existing per-micro-batch lockstep loop, entirely unchanged.
+    pipeline_overlap_microbatches: bool = False
+
     # Gradient checkpointing - trades recomputation for activation
     # memory. Real leverage against this repo's own OOM history at
     # large scale (qwen38_27b's linear-attention reference kernel is
@@ -459,6 +486,130 @@ def _forward_stage(stage_layers, hidden, position_ids, pos_emb, use_checkpoint: 
     return out
 
 
+def run_gpipe_window(window_items, rank, is_first, is_last, prev_rank, next_rank, device, config,
+                      embed, stage_layers, rotary, norm, lm_head, hidden_size,
+                      batches, response_masks, use_checkpoint) -> list[float]:
+    """Real multi-micro-batch pipeline overlap - see
+    PipelineConfig.pipeline_overlap_microbatches's field comment for the
+    why. `window_items` is a list of (b, step_counter) tuples, at most
+    grad_accum_steps long (fewer at the tail of a resume). Runs ALL
+    forwards for the window first (async isend + one-ahead irecv
+    prefetch), THEN all backwards, THEN returns - the CALLER still owns
+    optimizer.zero_grad()/step() around this call, exactly like the
+    per-micro-batch loop does. Returns the last stage's per-micro-batch
+    loss list (empty on other ranks) - same shape as the existing loop
+    appends to `losses`.
+
+    Tags are GLOBALLY UNIQUE per (direction, micro-batch) across the
+    whole run - NOT the `step_counter % 8` rotation the per-micro-batch
+    loop uses. A real bug found via a direct hang on the LAST window of
+    an 8-window run (window 8 reusing window 7's exact tag set, since
+    step_counter % 8 repeats every 8 steps): the Rust engine keys each
+    tag string to a persistent, reusable channel/stream
+    (`multiplexed_driver.rs`'s `out_channels: HashMap<String,
+    OutboundChannel>`, one pending-send slot, not a fresh stream per
+    message) - safe for the per-micro-batch loop's strictly sequential
+    one-message-at-a-time-per-tag usage, but NOT safe for this
+    scheduler's overlapping (prefetch depth 1) usage, where a new
+    window's first send/recv on a tag can start before the previous
+    window's use of that SAME tag is fully settled on both sides, not
+    just locally `.wait()`-ed. Using a tag exactly once, ever, per
+    (direction, micro-batch) sidesteps the whole class of bug instead of
+    fully diagnosing the Rust-side mechanism. `kind` also keeps the
+    forward-hidden and backward-gradient channels in separate
+    namespaces - the OLD `tag_for(i)` (fixed, before this bug was found)
+    reused the SAME value for both, which is itself a second real
+    instance of the same underlying mistake."""
+    n = len(window_items)
+    position_ids = torch.arange(config.seq_len, device=device).unsqueeze(0).expand(config.batch, -1)
+
+    def tag_for(i, kind):
+        step = window_items[i][1]
+        return step if kind == "fwd" else step + 1_000_000_000
+
+    def recv_shape_buf():
+        return torch.zeros(config.batch, config.seq_len, hidden_size, dtype=config.torch_dtype)
+
+    outs: list = [None] * n          # is_last: loss tensor: others: post-layers activation (keeps grad graph)
+    hidden_ins: list = [None] * n    # non-first ranks only: the received activation (needs .grad sent upstream)
+    losses: list[float] = []
+
+    # ---- forward phase: all n micro-batches, one-ahead irecv prefetch ----
+    pending_recv = {}
+    if not is_first:
+        buf0 = recv_shape_buf()
+        pending_recv[0] = (buf0, dist.irecv(buf0, src=prev_rank, tag=tag_for(0, "fwd")))
+
+    pending_fwd_send = {}
+    for i in range(n):
+        b, _ = window_items[i]
+        block = batches[b]
+
+        if is_first:
+            input_ids = block[:, :-1].to(device)
+            hidden = embed(input_ids).to(config.torch_dtype)
+            hidden_in = None
+        else:
+            buf, work = pending_recv.pop(i)
+            work.wait()
+            hidden_in = buf.to(device).requires_grad_(True)
+            hidden = hidden_in
+            if i + 1 < n:
+                buf_next = recv_shape_buf()
+                pending_recv[i + 1] = (buf_next, dist.irecv(buf_next, src=prev_rank, tag=tag_for(i + 1, "fwd")))
+
+        pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+        out = _forward_stage(stage_layers, hidden, position_ids, pos_emb, use_checkpoint)
+
+        if is_last:
+            mask = response_masks[b]
+            labels = block[:, 1:].to(device)
+            resp_mask = mask[:, 1:].to(device).float()
+            out_normed = norm(out)
+            logits = lm_head(out_normed.to(lm_head.weight.dtype))
+            per_token = nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(), labels.reshape(-1), reduction="none"
+            ).reshape(resp_mask.shape)
+            outs[i] = (per_token * resp_mask).sum() / resp_mask.sum().clamp(min=1)
+        else:
+            out_cpu = out.detach().to(config.torch_dtype).cpu()
+            pending_fwd_send[i] = dist.isend(out_cpu, dst=next_rank, tag=tag_for(i, "fwd"))
+            outs[i] = out
+        hidden_ins[i] = hidden_in
+
+    for work in pending_fwd_send.values():
+        work.wait()
+
+    # ---- backward phase: all n micro-batches, one-ahead irecv prefetch ----
+    pending_grad_recv = {}
+    if not is_last:
+        gbuf0 = recv_shape_buf()
+        pending_grad_recv[0] = (gbuf0, dist.irecv(gbuf0, src=next_rank, tag=tag_for(0, "grad")))
+
+    pending_grad_send = {}
+    for i in range(n):
+        if is_last:
+            loss = outs[i]
+            (loss / config.grad_accum_steps).backward()
+            losses.append(loss.item())
+        else:
+            gbuf, work = pending_grad_recv.pop(i)
+            work.wait()
+            if i + 1 < n:
+                gbuf_next = recv_shape_buf()
+                pending_grad_recv[i + 1] = (gbuf_next, dist.irecv(gbuf_next, src=next_rank, tag=tag_for(i + 1, "grad")))
+            outs[i].backward(gbuf.to(device))
+
+        if not is_first:
+            grad_cpu = hidden_ins[i].grad.detach().to(config.torch_dtype).cpu()
+            pending_grad_send[i] = dist.isend(grad_cpu, dst=prev_rank, tag=tag_for(i, "grad"))
+
+    for work in pending_grad_send.values():
+        work.wait()
+
+    return losses
+
+
 def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig, job_id: str = "pipeline_finetune", local_gpu: int | None = None) -> list[float]:
     """Runs the full N-stage pipeline training loop for this rank and
     returns the last-stage's per-step loss list (empty on non-last
@@ -657,74 +808,113 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     t_start = time.monotonic()
     step_counter = 0
 
+    def _post_window_bookkeeping(last_step_counter: int, epoch: int, last_b: int):
+        """Logging/checkpoint/eval, shared by both scheduling paths -
+        checked once per WINDOW in the overlap path (vs. once per
+        MICRO-BATCH in the original path) - see
+        pipeline_overlap_microbatches's field comment for why a window
+        IS the natural granularity there (one optimizer.step() per
+        window, same as before)."""
+        if last_step_counter <= 3 or last_step_counter % config.log_every == 0:
+            msg = f"[rank {rank}] step {last_step_counter}/{total_steps}"
+            if is_last and losses:
+                msg += f" loss={losses[-1]:.4f} ppl={perplexity(losses[-1]):.2f}"
+            print(msg, flush=True)
+        if is_last and losses:
+            logger.log(event="step", step=last_step_counter, epoch=epoch, loss=losses[-1], perplexity=perplexity(losses[-1]))
+
+        if config.checkpoint_dir and config.checkpoint_every > 0 and last_step_counter % config.checkpoint_every == 0:
+            path = save_checkpoint(
+                config.checkpoint_dir, rank, peft_model, optimizer,
+                CheckpointState(step=last_step_counter, epoch=epoch, batch_index=last_b),
+                keep_last=config.checkpoint_keep_last,
+            )
+            print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
+
+        if config.eval_every > 0 and eval_batches is not None and last_step_counter % config.eval_every == 0:
+            eval_loss = eval_pass(f"eval_{last_step_counter}")
+            if is_last and eval_loss is not None:
+                print(f"[rank {rank}] step {last_step_counter} eval_loss={eval_loss:.4f} eval_ppl={perplexity(eval_loss):.2f}", flush=True)
+                logger.log(event="eval", step=last_step_counter, eval_loss=eval_loss, eval_perplexity=perplexity(eval_loss))
+
     for epoch in range(config.epochs):
-        for b in range(n_steps):
-            step_counter += 1
-            if step_counter <= resume_step:
-                continue  # already completed in a previous, interrupted run
+        if config.pipeline_overlap_microbatches:
+            b = 0
+            while b < n_steps:
+                window_items = []  # list of (b, step_counter), <= grad_accum_steps long
+                while b < n_steps and len(window_items) < config.grad_accum_steps:
+                    step_counter += 1
+                    if step_counter > resume_step:
+                        window_items.append((b, step_counter))
+                    b += 1
+                if not window_items:
+                    continue  # this whole window was already done in a previous, interrupted run
 
-            # See rlhf.py's run_dpo_training's identical per-step
-            # barrier for why: a rank finishing a step faster than
-            # another can leave the slower rank's connection idle long
-            # enough for the underlying QUIC connection's own idle
-            # timeout to fire before the next step's first send/recv.
-            # Uses _step_barrier, NOT dist.barrier() - see that
-            # function's docstring for why a second dist.barrier() call
-            # is a silent no-op.
-            _step_barrier(signaling_url, config, f"sft_{epoch}_{b}", job_id=barrier_job_id)
-            tag = step_counter % 8
-            block = batches[b]
-            mask = response_masks[b]
+                first_step = window_items[0][1]
+                # One barrier per WINDOW, not per micro-batch - see
+                # pipeline_overlap_microbatches's field comment for why
+                # this is still enough to avoid the original idle-
+                # timeout problem without serializing every micro-batch.
+                _step_barrier(signaling_url, config, f"gpipe_{epoch}_{first_step}", job_id=barrier_job_id)
 
-            is_accum_start = (step_counter - 1) % config.grad_accum_steps == 0
-            is_accum_end = (step_counter % config.grad_accum_steps == 0) or (step_counter == total_steps)
-            if is_accum_start:
                 optimizer.zero_grad()
-
-            loss_or_out, hidden_in = forward_pipeline_step(block, mask, tag, use_checkpoint=config.gradient_checkpointing)
-
-            if is_last:
-                loss = loss_or_out
-                (loss / config.grad_accum_steps).backward()
-                losses.append(loss.item())
-            else:
-                out = loss_or_out
-                grad = torch.zeros(config.batch, config.seq_len, hidden_size, dtype=config.torch_dtype)
-                dist.recv(grad, src=next_rank, tag=tag)
-                out.backward(grad.to(device))
-
-            if not is_first:
-                grad_cpu = hidden_in.grad.detach().to(config.torch_dtype).cpu()
-                if config.overlap_communication:
-                    _isend_with_lookback(grad_cpu, prev_rank, tag, "grad")
-                else:
-                    dist.send(grad_cpu, dst=prev_rank, tag=tag)
-
-            if is_accum_end:
-                optimizer.step()
-
-            if step_counter <= 3 or step_counter % config.log_every == 0:
-                msg = f"[rank {rank}] step {step_counter}/{total_steps}"
-                if is_last:
-                    msg += f" loss={losses[-1]:.4f} ppl={perplexity(losses[-1]):.2f}"
-                print(msg, flush=True)
-            if is_last:
-                logger.log(event="step", step=step_counter, epoch=epoch, loss=losses[-1] if losses else None,
-                            perplexity=perplexity(losses[-1]) if losses else None)
-
-            if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:
-                path = save_checkpoint(
-                    config.checkpoint_dir, rank, peft_model, optimizer,
-                    CheckpointState(step=step_counter, epoch=epoch, batch_index=b),
-                    keep_last=config.checkpoint_keep_last,
+                window_losses = run_gpipe_window(
+                    window_items, rank, is_first, is_last, prev_rank, next_rank, device, config,
+                    embed, stage_layers, rotary, norm, lm_head, hidden_size,
+                    batches, response_masks, config.gradient_checkpointing,
                 )
-                print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
+                optimizer.step()
+                if is_last:
+                    losses.extend(window_losses)
 
-            if config.eval_every > 0 and eval_batches is not None and step_counter % config.eval_every == 0:
-                eval_loss = eval_pass(f"eval_{step_counter}")
-                if is_last and eval_loss is not None:
-                    print(f"[rank {rank}] step {step_counter} eval_loss={eval_loss:.4f} eval_ppl={perplexity(eval_loss):.2f}", flush=True)
-                    logger.log(event="eval", step=step_counter, eval_loss=eval_loss, eval_perplexity=perplexity(eval_loss))
+                _post_window_bookkeeping(window_items[-1][1], epoch, window_items[-1][0])
+        else:
+            for b in range(n_steps):
+                step_counter += 1
+                if step_counter <= resume_step:
+                    continue  # already completed in a previous, interrupted run
+
+                # See rlhf.py's run_dpo_training's identical per-step
+                # barrier for why: a rank finishing a step faster than
+                # another can leave the slower rank's connection idle long
+                # enough for the underlying QUIC connection's own idle
+                # timeout to fire before the next step's first send/recv.
+                # Uses _step_barrier, NOT dist.barrier() - see that
+                # function's docstring for why a second dist.barrier() call
+                # is a silent no-op.
+                _step_barrier(signaling_url, config, f"sft_{epoch}_{b}", job_id=barrier_job_id)
+                tag = step_counter % 8
+                block = batches[b]
+                mask = response_masks[b]
+
+                is_accum_start = (step_counter - 1) % config.grad_accum_steps == 0
+                is_accum_end = (step_counter % config.grad_accum_steps == 0) or (step_counter == total_steps)
+                if is_accum_start:
+                    optimizer.zero_grad()
+
+                loss_or_out, hidden_in = forward_pipeline_step(block, mask, tag, use_checkpoint=config.gradient_checkpointing)
+
+                if is_last:
+                    loss = loss_or_out
+                    (loss / config.grad_accum_steps).backward()
+                    losses.append(loss.item())
+                else:
+                    out = loss_or_out
+                    grad = torch.zeros(config.batch, config.seq_len, hidden_size, dtype=config.torch_dtype)
+                    dist.recv(grad, src=next_rank, tag=tag)
+                    out.backward(grad.to(device))
+
+                if not is_first:
+                    grad_cpu = hidden_in.grad.detach().to(config.torch_dtype).cpu()
+                    if config.overlap_communication:
+                        _isend_with_lookback(grad_cpu, prev_rank, tag, "grad")
+                    else:
+                        dist.send(grad_cpu, dst=prev_rank, tag=tag)
+
+                if is_accum_end:
+                    optimizer.step()
+
+                _post_window_bookkeeping(step_counter, epoch, b)
 
         elapsed = time.monotonic() - t_start
         if is_last:

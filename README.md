@@ -345,7 +345,60 @@ yet done.
   (removing that barrier for a true streaming pipeline) would very
   likely show a much larger effect, especially over a higher-RTT link,
   but that's a materially bigger, riskier restructuring than this flag -
-  not attempted here.
+  attempted below, not left as a TODO.
+
+- [x] **Real multi-micro-batch pipeline overlap** (`config.pipeline_overlap_microbatches`)
+  - the actual fix for `overlap_communication`'s own documented
+  ceiling above: this one removes the per-micro-batch `_step_barrier`
+  and instead runs a real GPipe-style schedule per accumulation window
+  (`finetune.run_gpipe_window` - all forwards for the window first,
+  async `isend` + one-ahead `irecv` prefetch, THEN all backwards, THEN
+  one `optimizer.step()`) - requires `grad_accum_steps > 1` to do
+  anything, and only ONE `_step_barrier` per WINDOW instead of per
+  micro-batch. Still no Rust work - same transport primitives as
+  `overlap_communication` above, just used across MULTIPLE
+  concurrently-in-flight micro-batches instead of one at a time.
+
+  **A real bug found and fixed during validation, not just written and
+  assumed correct**: the first end-to-end test hung, deterministically,
+  on the LAST window of an 8-window run - rank0 stuck waiting on a
+  gradient that never arrived, while rank1 had already finished
+  cleanly. Root cause, found by reading the Rust engine's source, not
+  guessed: `multiplexed_driver.rs` keys each message tag string to a
+  **persistent, reusable channel/stream**
+  (`out_channels: HashMap<String, OutboundChannel>`, one pending-send
+  slot, not a fresh stream per message) - safe for the per-micro-batch
+  loop's strictly-sequential one-tag-at-a-time usage, but NOT safe for
+  this scheduler's overlapping usage: window 8 reused window 7's exact
+  tag set (`step_counter % 8` repeats every 8 steps), and a new
+  window's first send/recv on a tag could start before the previous
+  window's use of that same tag was fully settled on both sides, not
+  just locally `.wait()`-ed. The original tag scheme also reused the
+  SAME tag for the forward-hidden channel and the backward-gradient
+  channel - a second real instance of the same mistake. Fixed by making
+  every tag globally unique per (direction, micro-batch) for the whole
+  run, sidestepping the whole class of bug rather than fully
+  characterizing the exact Rust-side race. Re-tested 3 times after the
+  fix (including the exact window-7-to-8 boundary that hung before) -
+  clean every time.
+
+  **Validated results, loopback AND real cross-machine** (Qwen2.5-0.5B,
+  2-stage pipeline, `grad_accum_steps=8` loopback / `4` cross-machine):
+  correctness - loss bit-identical to the non-overlap path at every
+  matching step, both settings. Timing: loopback 33.1s -> ~23-25s across
+  3 repeated runs (**~28% faster**); cross-machine (local <-> a real
+  remote GCP box) 39.9s -> 18.7s (**~53% faster, more than 2x**) - a
+  dramatically bigger win than `overlap_communication` alone, and
+  bigger cross-machine than loopback as expected (real network latency
+  is exactly what this schedule hides behind compute, unlike loopback's
+  near-zero latency).
+
+  **Real cost, not free**: peak activation memory scales with
+  `grad_accum_steps` - every micro-batch's activation in the window
+  stays alive in GPU memory until ITS backward runs, not just one at a
+  time. `examples/configs/qwen25_0.5b_lora_pipeline_overlap.yaml` is a
+  real, validated example. Only wired into `finetune.py`'s SFT/CPT path
+  so far, not into `rlhf.py`'s DPO/GRPO/PPO/RLOO/RM/PRM.
 
 ## Known limitations
 
