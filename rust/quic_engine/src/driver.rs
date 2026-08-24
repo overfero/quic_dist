@@ -31,6 +31,16 @@
 //! protocol ever touches this socket again once a `ConnectionDriver`
 //! exists, so the tag byte simply isn't needed - a real simplification
 //! versus the asyncio-era wire format, not just a port.
+//!
+//! **In `quic_dist` specifically: intentionally kept, not used by
+//! `ProcessGroupQUIC`.** `process_group.py` talks to
+//! `multiplexed_driver.rs`'s `MultiplexedConnectionDriver` exclusively
+//! (multiple named channels per connection, one per message tag). This
+//! single-channel driver is retained as a known-good reference
+//! implementation - several real bugs in `multiplexed_driver.rs` (see
+//! `docs/development-log.md`) were found by diffing its behavior against
+//! this simpler, already-validated sibling, not dead code left over from
+//! a migration.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};

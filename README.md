@@ -10,6 +10,21 @@ Standalone: this package has no dependency on vLLM or any other project.
 It vendors its own copy of the UDP hole-punch client (`holepunch/peer.py`)
 and its own small Rust workspace (`rust/`) for the QUIC engine.
 
+## Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [Scope](#scope)
+- [Architecture](#architecture)
+- [Config-driven pipeline LoRA/QLoRA fine-tuning](#config-driven-pipeline-loraqlora-fine-tuning)
+- [Config-driven pipeline DPO/GRPO/PPO](#config-driven-pipeline-dpogrpoppo)
+- [Config-driven pipeline multimodal (vision-language) SFT](#config-driven-pipeline-multimodal-vision-language-sft)
+- [Examples](#examples)
+- [Tests](#tests)
+- [Profiling](#profiling)
+- [API reference](#api-reference)
+- [Known limitations](#known-limitations)
+
 ## Install
 
 ```bash
@@ -65,6 +80,19 @@ Point-to-point communication only: `send`/`recv`/`isend`/`irecv`/`barrier`.
 Every collective (`all_reduce`, `all_gather`, `broadcast`, ...) raises
 `NotImplementedError` by explicit design — not a silent no-op, not a
 fallback to another backend.
+
+## Architecture
+
+`ProcessGroupQUIC` (registered backend `"quic"`) sits directly under
+`torch.distributed`; a vendored UDP hole-punch client establishes each
+peer connection, handed off to a Rust-native, multi-channel QUIC driver
+(one connection per peer, one named channel per `tag`) that owns the
+real socket on its own background thread. See
+[`docs/architecture.md`](docs/architecture.md) for the full component
+diagram, the connection-establishment sequence, the Rust workspace
+layout, and a callout on the two genuinely separate signaling-server
+flows (hole-punch vs. the rendezvous key-value store) that share one
+HTTP process but serve unrelated purposes.
 
 ## Config-driven pipeline LoRA/QLoRA fine-tuning
 
@@ -169,294 +197,86 @@ match the checkpoint's real native dtype (this one is float16, not the
 0.5B proof's bfloat16) - both are real, direct crashes if wrong, not
 silent degradations.
 
+## Examples
+
+19 rank scripts live in `examples/`, split into two families: most are
+config-driven (`<config.yaml> <rank> <signaling_url> [job_id]`), a few
+are hand-rolled pedagogical scripts with no config file. See
+[`examples/README.md`](examples/README.md) for the full table of every
+script (which family, exact usage, what it needs) and one complete,
+copy-pasteable walkthrough end to end.
+
 ## Tests
 
 ```bash
 cd tests
 pip install pytest
-python3 -m pytest test_store.py test_process_group.py test_pipeline.py test_parallel_stream.py -q
+python3 -m pytest -q
 ```
 
-These spin up a real local signaling server and real hole-punched QUIC
-connections (loopback) — no mocking, and live in `tests/` alongside
-their own `_helpers.py`. `examples/` holds the standalone,
-directly-run scripts (`cross_machine_rank.py`, `lora_pipeline_rank.py`,
-`real_llm_pipeline_rank.py`, `vision_shape_rank.py`,
-`vision_pipeline_rank.py`, `n3_cross_machine_rank.py`,
-`pipeline_finetune_rank.py`, `dpo_pipeline_rank.py`,
-`grpo_pipeline_rank.py`, `ppo_pipeline_rank.py`, `rm_pipeline_rank.py`,
-`prm_pipeline_rank.py`, `multimodal_pipeline_rank.py`,
-`bench_quic_dist.py`)
-plus the `configs/` and `data/` they read from - run one instance per
-machine/rank, pointed at a real publicly reachable signaling URL.
+Most of these spin up a real local signaling server and real
+hole-punched QUIC connections (loopback) — no mocking, and live in
+`tests/` alongside their own `_helpers.py`. Two files are the
+exception, pure CPU with no network/signaling server needed:
+`test_checkpoint.py` (exercises `training_utils.py`'s checkpoint
+save/load/resume directly) and `test_config_parsing.py` (round-trips
+every training mode's config `.from_file()`). `examples/` holds the standalone,
+directly-run scripts plus the `configs/` and `data/` they read from —
+see [Examples](#examples) above — run one instance per machine/rank,
+pointed at a real publicly reachable signaling URL.
 
-## Training infrastructure checklist
+## Profiling
 
-Ordered lightest -> heaviest by implementation weight; items marked
-**[transport]** touch quic_dist's own send/recv/barrier path
-(`process_group.py` / the Rust engine) - everything else is
-training-loop-local bookkeeping and carries no transport risk. `[x]`
-done and validated with a real run (see each item's note); `[ ]` not
-yet done.
+`QUIC_DIST_RUST_DEBUG=1` is a real, working diagnostic that reports
+live QUIC connection state (congestion window, RTT, loss, ACK/frame
+counts) directly from quinn-proto — used throughout this project's own
+bug-hunting history. See [`docs/profiling.md`](docs/profiling.md) for
+how to enable it, what each field means, and a worked example of
+distinguishing real network loss from a stalled driver loop.
 
-- [x] **Reproducible config (seeding)** - `training_utils.set_seed()`,
-  same seed on every rank. `PipelineConfig.seed`/`RLHFModelConfig.seed`.
-- [x] **Experiment tracking (loss, perplexity)** - `training_utils.ExperimentLogger`,
-  plain JSONL, `config.log_path`. Includes a config snapshot at the
-  start of the log.
-- [x] **Gradient accumulation** - `config.grad_accum_steps` in `finetune.py`.
-- [x] **Gradient checkpointing** - `config.gradient_checkpointing` in
-  `finetune.py` (`torch.utils.checkpoint`, `use_reentrant=False`, with
-  `peft_model.enable_input_require_grads()` for the frozen-embedding
-  case).
-- [x] **Distributed checkpoint save/resume** (model=trainable params
-  only, optimizer state, RNG state, dataloader/step position) -
-  `training_utils.save_checkpoint`/`load_checkpoint`, `config.checkpoint_dir`/
-  `checkpoint_every`/`checkpoint_keep_last`. Resuming is automatic
-  (the same launch command works for a first run or a restart) -
-  validated with a real kill-mid-run-then-relaunch test on
-  `finetune.py`'s SFT/CPT path: the resumed run reproduced the exact
-  same losses the killed run had already logged for the steps it
-  re-entered (bit-identical, confirming the RNG state genuinely
-  restored, not just "training continued somehow"). A real bug was
-  found and fixed by this test: `torch.load(..., map_location=<cuda
-  device>)` relocates the saved RNG state tensors to the GPU too,
-  which `torch.set_rng_state`/`torch.cuda.set_rng_state_all` then
-  reject - fixed by forcing those specific tensors back to CPU
-  regardless of the checkpoint's overall `map_location`. A second real
-  bug: reusing the same `job_id` across a crashed attempt and its
-  resume can let `_step_barrier`'s per-step store keys collide with
-  the crashed attempt's leftover (possibly only-partially-satisfied)
-  state - fixed by namespacing each attempt's barrier keys with its
-  resume step number.
-- [x] **Automatic evaluation after checkpoint** - `config.eval_every`/
-  `eval_num_examples` in `finetune.py`, a held-out TAIL slice of the
-  same dataset (no second dataset config needed), forward-only through
-  the same pipeline, logged as `eval_loss`/`eval_perplexity`.
-- [x] Reference wiring above is `finetune.py` (SFT/CPT); `rlhf.py`'s
-  `run_dpo_training` has seed/logging/checkpoint+resume too (also
-  validated with a real run), proving the utilities generalize beyond
-  one training mode.
-- [ ] Wire seed/logging/checkpoint+resume into `rlhf.py`'s remaining
-  modes (GRPO, PPO, RLOO, RM, PRM) and into `distill.py`/`pretrain.py` -
-  same utilities, not yet threaded through each loop individually.
-- [ ] **Mixed precision** - arguably already the case in spirit
-  (compute at `config.compute_dtype`, loss/softmax explicitly cast to
-  fp32 - see `finetune.py`'s dtype-boundary comments) but not a formal
-  `torch.autocast` wrapping; not attempted given the existing
-  bitsandbytes-quantized layers' own internal dtype handling.
-- [ ] **Benchmark integration** - a standard external eval (e.g. a
-  fixed perplexity benchmark corpus) beyond the in-repo held-out-slice
-  eval above.
-- [x] **Flash attention** - the OFFICIAL `flash-attn` PyPI package
-  genuinely fails here: `pip install flash-attn --no-build-isolation`
-  builds a wheel successfully (~2-3 min, faster than expected) but the
-  compiled extension fails to import - `undefined symbol:
-  _ZN3c105Error...`, a real C++ ABI mismatch against the installed
-  torch build (a well-known flash-attn pain point - needs a wheel built
-  against the exact torch/CUDA/ABI combo in use). Uninstalled rather
-  than left broken.
+## API reference
 
-  Tried a real alternative instead of stopping there:
-  [ssiu/flash-attention-turing](https://github.com/ssiu/flash-attention-turing),
-  a community FlashAttention implementation specifically for Turing GPUs
-  (compute capability 7.5 - T4, this project's real GPUs). Its raw
-  kernels ARE correct and fast, verified directly, not assumed: forward
-  max diff 0.000488 / backward dQ max diff 0.001953 vs. torch's own
-  SDPA (fp16 numerical noise, not a bug), 1.27x real forward speedup in
-  isolation. Built `flash_attn_turing_shim/` (new, its own README) - a
-  real compatibility package presenting these kernels under the
-  `flash_attn` name/API surface `transformers` imports unconditionally,
-  including the `dropout_p`/`deterministic`/`softcap`/`window_size`
-  argument-adaptation `transformers` always passes (the underlying
-  kernels don't support dropout, softcap, or sliding-window - the shim
-  raises loudly, not silently, if one is actually requested with a
-  non-default value). Verified end-to-end through BOTH `transformers`'
-  regular `model.forward()` AND this repo's own direct-decoder-layer
-  call pattern (`finetune.py`'s `run_decoder_layer`) - real loss, real
-  backward, real gradients either way. Wired into `finetune.py` as
-  `config.attn_implementation` (default `"sdpa"`, unchanged behavior;
-  `rlhf.py`'s `RLHFModelConfig` got the same field since it reuses
-  `build_stage_model` via duck typing).
+`quic_dist`'s public surface (`__init__.py`'s `__all__`):
 
-  **Honest end-to-end result, not oversold, AND scale-dependent -
-  measured at two real sizes, not just one**:
-  - Qwen2.5-0.5B, 2-stage pipeline: NO end-to-end win - seq_len=128:
-    19.3s (sdpa) vs. 22.1s (flash, SLOWER); seq_len=512: 22.6s both
-    (tied). At this size, attention isn't the training step's
-    bottleneck, so a faster attention kernel alone doesn't move total
-    wall-clock time.
-  - Qwen2.5-7B, 2-stage pipeline, seq_len=1024, a genuine apples-to-
-    apples A/B (both runs `cpu_offload_unused_layers=false`, since
-    `transformers`' flash_attention_2 path rejects any device_map
-    containing `"cpu"` entries - see the real incompatibility noted
-    below, found via a direct crash, not assumed): 243.3s (sdpa) vs.
-    238.6s (flash) - a real, if modest, ~2% WIN this time. Loss matched
-    closely at both sizes (3.0505 vs 3.0512 at 0.5B/seq_len=128; 2.7185
-    vs. 2.7179 at 7B), confirming correctness held throughout, not just
-    in the isolated kernel test.
-
-  The crossover is the real finding: attention is a small fraction of
-  the step at 0.5B/short-context, big enough to matter at 7B/seq_len
-  1024. Kept as a real, validated, opt-in capability
-  (`examples/configs/qwen25_0.5b_lora_flash_attn.yaml`) - worth
-  testing at even larger scale/longer context, which this project
-  hasn't done. Not useful for `qwen38_27b`'s hybrid architecture
-  regardless of scale - its `linear_attention` blocks use a completely
-  different mechanism, unaffected by flash attention's
-  `full_attention`-only speedup.
-
-  **Real, found-not-assumed incompatibility**: `transformers`'
-  `flash_attention_2` loading path raises `ValueError` on ANY
-  device_map containing a `"cpu"` entry - which is exactly what
-  `cpu_offload_unused_layers=True` relies on (the mechanism that lands
-  "other ranks' layers" on the meta device at ~0 real memory for larger
-  models split across a pipeline - see `build_device_map()`'s
-  docstring). So `attn_implementation: flash_attention_2` currently
-  only works for configs that don't need that offload - either a small
-  enough model that each rank can afford to hold the WHOLE thing
-  redundantly (what both A/B tests above actually did - a 7B model in
-  4bit is only ~3.5GB, comfortably fits per-rank on a 15GB T4 even
-  loaded twice), or a future change to route "other" layers somewhere
-  flash_attention_2 accepts instead of `"cpu"`.
-- [x] **Communication/computation overlap** - turned out NOT to need
-  Rust work, correcting an earlier wrong assumption in this checklist:
-  `process_group.py`'s `isend`/`irecv` (`work.py`, a genuine background-
-  thread + `torch.futures.Future` implementation, its own docstring
-  already states its purpose is exactly this) already existed and were
-  already validated - what was missing was the TRAINING LOOP using
-  them. `finetune.py`'s `config.overlap_communication` converts the
-  forward-activation send (non-last ranks) and backward-gradient send
-  (non-first ranks) from blocking `send` to `isend`, deferring the wait
-  on each one until right before the NEXT send of the same kind (or
-  teardown) - so the calling thread moves on to its next blocking call
-  instead of idling through the hand-off. Validated on a real 0.5B run
-  BOTH loopback and real cross-machine (local <-> a real remote GCP
-  box, genuine hole-punch, `grad_accum_steps` 8 loopback / 4 cross-
-  machine): correctness held both times - bit-identical mean loss with
-  the flag on vs. off (4.6165 loopback, 4.1430 cross-machine), not just
-  "didn't crash". Timing: loopback 32.4s vs. 33.5s (~3%), cross-machine
-  39.1s vs. 41.2s (~5%) - a real, if modest, win both times, slightly
-  larger cross-machine as expected (more actual network latency to
-  hide behind deferred waits). The modesty is an honest, expected
-  consequence of this architecture's own per-step `_step_barrier`
-  forcing every rank back into lockstep each micro-step (see that
-  function's docstring) - genuine multi-micro-batch staggering
-  (removing that barrier for a true streaming pipeline) would very
-  likely show a much larger effect, especially over a higher-RTT link,
-  but that's a materially bigger, riskier restructuring than this flag -
-  attempted below, not left as a TODO.
-
-- [x] **Real multi-micro-batch pipeline overlap** (`config.pipeline_overlap_microbatches`)
-  - the actual fix for `overlap_communication`'s own documented
-  ceiling above: this one removes the per-micro-batch `_step_barrier`
-  and instead runs a real GPipe-style schedule per accumulation window
-  (`finetune.run_gpipe_window` - all forwards for the window first,
-  async `isend` + one-ahead `irecv` prefetch, THEN all backwards, THEN
-  one `optimizer.step()`) - requires `grad_accum_steps > 1` to do
-  anything, and only ONE `_step_barrier` per WINDOW instead of per
-  micro-batch. Still no Rust work - same transport primitives as
-  `overlap_communication` above, just used across MULTIPLE
-  concurrently-in-flight micro-batches instead of one at a time.
-
-  **A real bug found and fixed during validation, not just written and
-  assumed correct**: the first end-to-end test hung, deterministically,
-  on the LAST window of an 8-window run - rank0 stuck waiting on a
-  gradient that never arrived, while rank1 had already finished
-  cleanly. Root cause, found by reading the Rust engine's source, not
-  guessed: `multiplexed_driver.rs` keys each message tag string to a
-  **persistent, reusable channel/stream**
-  (`out_channels: HashMap<String, OutboundChannel>`, one pending-send
-  slot, not a fresh stream per message) - safe for the per-micro-batch
-  loop's strictly-sequential one-tag-at-a-time usage, but NOT safe for
-  this scheduler's overlapping usage: window 8 reused window 7's exact
-  tag set (`step_counter % 8` repeats every 8 steps), and a new
-  window's first send/recv on a tag could start before the previous
-  window's use of that same tag was fully settled on both sides, not
-  just locally `.wait()`-ed. The original tag scheme also reused the
-  SAME tag for the forward-hidden channel and the backward-gradient
-  channel - a second real instance of the same mistake. Fixed by making
-  every tag globally unique per (direction, micro-batch) for the whole
-  run, sidestepping the whole class of bug rather than fully
-  characterizing the exact Rust-side race. Re-tested 3 times after the
-  fix (including the exact window-7-to-8 boundary that hung before) -
-  clean every time.
-
-  **Validated results, loopback AND real cross-machine** (Qwen2.5-0.5B,
-  2-stage pipeline, `grad_accum_steps=8` loopback / `4` cross-machine):
-  correctness - loss bit-identical to the non-overlap path at every
-  matching step, both settings. Timing: loopback 33.1s -> ~23-25s across
-  3 repeated runs (**~28% faster**); cross-machine (local <-> a real
-  remote GCP box) 39.9s -> 18.7s (**~53% faster, more than 2x**) - a
-  dramatically bigger win than `overlap_communication` alone, and
-  bigger cross-machine than loopback as expected (real network latency
-  is exactly what this schedule hides behind compute, unlike loopback's
-  near-zero latency).
-
-  **Real cost, not free**: peak activation memory scales with
-  `grad_accum_steps` - every micro-batch's activation in the window
-  stays alive in GPU memory until ITS backward runs, not just one at a
-  time. `examples/configs/qwen25_0.5b_lora_pipeline_overlap.yaml` is a
-  real, validated example. Only wired into `finetune.py`'s SFT/CPT path
-  so far, not into `rlhf.py`'s DPO/GRPO/PPO/RLOO/RM/PRM.
-
-- [x] **Parallel-stream send/recv stall - resolved** (`ProcessGroupQUIC.
-  _use_parallel_streams`/`_chunk_plan` in `process_group.py`) - large
-  tensors fan out over several concurrent QUIC streams instead of one.
-  Previously shipped OFF by default (threshold effectively unreachable)
-  after a real, then-unresolved stall on repeated large sends over one
-  connection. This session found and fixed THREE independent, real root
-  causes (none of them the "Cubic app_limited" theory the code's own
-  prior comment spent most of its words on - that theory was plausible
-  from the stats alone but wasn't the actual mechanism):
-
-  1. Linux doubles whatever `SO_RCVBUF`/`SO_SNDBUF` value it grants
-     before returning it from `getsockopt()` (kernel bookkeeping, not
-     real payload capacity) - `window` in `process_group.py` used the
-     raw (doubled) value, confirmed directly (`getsockopt` returned
-     exactly 2x `net.core.rmem_max` on this project's own machines).
-  2. `max_congestion_window` was ALSO set to `8 * window` (the same
-     ratio as the flow-control windows) instead of `1 * window` - the
-     very ratio this project's own upstream
-     (`vllm/transport/quic_transport.py`) documents as correct ("capped
-     at 1x - not 8x") but whose own code, three lines below that
-     comment, still passes 8x - a real, pre-existing comment/code drift
-     inherited here unnoticed, caught by this session's direct repro.
-     Combined with #1, the effective cap was ~16x the real kernel
-     buffer, so `congestion.rs`'s `BoundedController` (built to prevent
-     exactly this) never actually engaged before self-induced loss did.
-  3. A genuine driver-loop bug in `multiplexed_driver.rs::
-     drive_channel_send`: a PARTIAL write (`write_stream` returning
-     `Ok(n)` with `n` < requested - a real limit hit, not a full block)
-     never set `blocked_on_writable`, so nothing ever re-drove that
-     channel unless a fresh `Writable` edge happened to fire on its own.
-     `driver.rs`'s older single-channel loop avoids this by retrying
-     unconditionally every tick; the multi-channel port never got the
-     same treatment - a channel could stall forever with data still
-     queued, zero loss, full peer ACK coverage, and free congestion-
-     window room, simply because nothing ever asked it to keep writing.
-
-  Fixing this also surfaced a real regression in `_get_or_connect`'s
-  auto-reconnect race (`ProcessGroupQUIC._retry_dead_conn`, new this
-  session): `is_dead()` is only checked BEFORE handing a connection to
-  the caller, so a connection dying WHILE a blocked `recv()` call is
-  in flight still raised the stale connection's own error instead of
-  transparently reconnecting - always possible, just rare enough that
-  the original (slower) driver loop's timing had apparently never hit
-  it in this test suite before. Fixed with a bounded one-retry wrapper.
-
-  **Validated results**: loopback (3 repeated runs of a back-to-back
-  large-message repro, plus an 8-message mixed-size stress run up to
-  32MB/message, byte-exact every time); the full pytest suite (19/19)
-  on two independent machines sharing the identical 208KB
-  `net.core.rmem_max`/`wmem_max` ceiling; and a REAL cross-machine run
-  over an actual network path (~1ms measured RTT, not loopback) for
-  both the basic and stress repros, byte-exact, no stall. Still off by
-  default pending a decision on the new default threshold - opt in via
-  `QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES`.
+| Name | What it is |
+|---|---|
+| `init_process_group(signaling_url, rank, world_size, job_id=, timeout=)` | Convenience wrapper: builds a `QuicRendezvousStore` and calls `dist.init_process_group(backend="quic", ...)`. The one function most users need. |
+| `ProcessGroupQUIC` | The `torch.distributed.ProcessGroup` implementation itself, registered as backend `"quic"`. `send`/`recv`/`isend`/`irecv`/`barrier` only — see [Scope](#scope). |
+| `QuicRendezvousStore` | A `torch.distributed.Store` backed by the signaling server's `/kv/*` API — used for rendezvous/barrier before any `ProcessGroup` exists. |
+| `serialize_tensor(tensor, message_id, microbatch_id, tensor_id)` / `deserialize_tensor(payload)` | Tensor⇄bytes conversion `ProcessGroupQUIC` uses internally — exported for anyone building on the wire format directly. |
+| `TensorMetadata` | The parsed-header type `deserialize_tensor` returns alongside the tensor. |
+| `submit_as_work(fn)` | Runs `fn` on a background thread, returns a real `torch.distributed.Work` — what `isend`/`irecv` are built on. |
 
 ## Known limitations
 
-See the full deliverable report for the complete architecture, design
-rationale, and an honest list of what's implemented vs. not:
-https://claude.ai/code/artifact/6677daa1-801f-44c9-b6b5-d42880632c6b
+- **Point-to-point only.** `all_reduce`/`all_gather`/`broadcast`/etc. all
+  raise `NotImplementedError` by explicit design (see [Scope](#scope)) —
+  not a silent no-op, not a fallback to another backend.
+- **CPU-tensor-only serialization** — GPU tensors are moved to CPU
+  before serialization and back after, at the `ProcessGroupQUIC`
+  boundary.
+- **One shared seed across every rank, by design** — reproducibility
+  means "this exact run reproduces," not a decorrelated RNG stream per
+  rank.
+- **`rlhf.py`'s GRPO/PPO/RLOO/RM/PRM modes** don't have
+  `pipeline_overlap_microbatches`/`overlap_communication` wired in yet
+  (only `finetune.py`'s SFT/CPT path and `rlhf.py`'s DPO path do).
+- **Parallel-stream send/recv is off by default**, even though fully
+  fixed and validated — pending a product decision on the new default
+  threshold, not a correctness concern. Opt in via
+  `QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES`.
+- **No formal mixed-precision (`torch.autocast`) wrapping.**
+- **No standard external benchmark integration** beyond the in-repo
+  held-out-slice eval.
+- **`distill.py`/`multimodal.py`'s new checkpoint/seed/log wiring**
+  (this session's polish pass) shares `pretrain.py`'s proven pattern and
+  is syntax/import-verified, but wasn't individually GPU-smoke-tested
+  the way `pretrain.py`'s was (a real kill-mid-run + resume test, see
+  `docs/development-log.md`) - would need downloading a real
+  teacher+student pair or a real LLaVA checkpoint, meaningfully more
+  expensive than `pretrain.py`'s from-scratch tiny model.
+
+Full real bug-fix and validation history — every item above, with the
+actual root causes and measured before/after numbers — lives in
+[`docs/development-log.md`](docs/development-log.md), out of this
+file's way so this page stays readable as onboarding material.

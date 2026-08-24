@@ -133,6 +133,25 @@ class MultimodalConfig:
     batch: int = 1  # one real example per pipeline step - see module docstring
     epochs: int = 3
 
+    # Reproducibility - same seed on every rank deliberately, see
+    # training_utils.set_seed's docstring.
+    seed: int = 42
+
+    # Attention implementation, passed straight through to
+    # AutoModelForImageTextToText.from_pretrained - see finetune.py's
+    # PipelineConfig.attn_implementation for the full story
+    # (flash_attention_2 needs flash_attn_turing_shim/ on Turing GPUs).
+    attn_implementation: str = "sdpa"
+
+    # Checkpoint save/resume - trainable (LoRA) params only, same
+    # contract as finetune.py's identical fields.
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0  # steps; 0 = never checkpoint even if checkpoint_dir is set
+    checkpoint_keep_last: int = 2
+
+    # Experiment tracking - plain JSONL, see training_utils.ExperimentLogger.
+    log_path: str | None = None
+
     @classmethod
     def from_file(cls, path: str) -> "MultimodalConfig":
         text = Path(path).read_text()
@@ -189,10 +208,14 @@ def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalCo
             bnb_4bit_quant_type=config.bnb_4bit_quant_type,
             llm_int8_enable_fp32_cpu_offload=config.cpu_offload_unused_layers,
         )
-        model = AutoModelForImageTextToText.from_pretrained(config.model_path, quantization_config=bnb_cfg, device_map=device_map)
+        model = AutoModelForImageTextToText.from_pretrained(
+            config.model_path, quantization_config=bnb_cfg, device_map=device_map, attn_implementation=config.attn_implementation,
+        )
     elif config.quantization == "8bit":
         bnb_cfg = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=config.cpu_offload_unused_layers)
-        model = AutoModelForImageTextToText.from_pretrained(config.model_path, quantization_config=bnb_cfg, device_map=device_map)
+        model = AutoModelForImageTextToText.from_pretrained(
+            config.model_path, quantization_config=bnb_cfg, device_map=device_map, attn_implementation=config.attn_implementation,
+        )
     else:
         # `dtype=` (the newer kwarg name) errors here specifically -
         # `LlavaForConditionalGeneration.__init__() got an unexpected
@@ -204,7 +227,9 @@ def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalCo
         # device_map= in the same call - some code path specific to
         # device_map+multimodal model classes here doesn't accept the
         # newer kwarg name.
-        model = AutoModelForImageTextToText.from_pretrained(config.model_path, torch_dtype=config.torch_dtype, device_map=device_map)
+        model = AutoModelForImageTextToText.from_pretrained(
+            config.model_path, torch_dtype=config.torch_dtype, device_map=device_map, attn_implementation=config.attn_implementation,
+        )
 
     lora_cfg = LoraConfig(
         r=config.lora_r, lora_alpha=config.lora_alpha,
@@ -316,12 +341,19 @@ def build_vlm_sft_dataset(processor, tokenizer, config: MultimodalConfig) -> lis
 
 def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalConfig,
                              job_id: str = "multimodal_pipeline") -> list[float]:
+    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint
+
+    set_seed(config.seed)
+
     from transformers import AutoTokenizer, AutoProcessor
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     processor = AutoProcessor.from_pretrained(config.model_path)
+
+    logger = ExperimentLogger(config.log_path, rank)
+    logger.log_config(config)
 
     local_gpu = rank % torch.cuda.device_count()
     device = torch.device(f"cuda:{local_gpu}")
@@ -355,14 +387,31 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
     total_steps = n_steps * config.epochs
     print(f"[rank {rank}] multimodal SFT: {config.epochs} epochs x {n_steps} examples = {total_steps} steps", flush=True)
 
+    resume_step = 0
+    if config.checkpoint_dir:
+        ckpt_state = load_checkpoint(config.checkpoint_dir, rank, peft_model, optimizer, map_location=device)
+        if ckpt_state is not None:
+            resume_step = ckpt_state.step
+            print(f"[rank {rank}] resumed from checkpoint at step {resume_step}/{total_steps}", flush=True)
+
+    # Real bug found via finetune.py's kill-mid-run + resume test (see
+    # that module's identical fix): reusing the SAME job_id for
+    # _step_barrier's store keys across a crashed attempt and its resume
+    # can silently under-satisfy the barrier. Namespacing by resume_step
+    # guarantees a resumed attempt never touches a crashed attempt's
+    # leftover keys.
+    barrier_job_id = f"{job_id}_r{resume_step}"
+
     losses: list[float] = []
     t_start = time.monotonic()
     step_counter = 0
 
     for epoch in range(config.epochs):
         for ex in examples:
-            _step_barrier(signaling_url, config, f"vlm_{step_counter}", job_id=job_id)
             step_counter += 1
+            if step_counter <= resume_step:
+                continue  # already completed in a previous, interrupted run
+            _step_barrier(signaling_url, config, f"vlm_{step_counter}", job_id=barrier_job_id)
             tag = step_counter % 8
             input_ids = ex["input_ids"].unsqueeze(0)  # (1, T)
             resp_mask = ex["response_mask"].to(device)
@@ -431,6 +480,16 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
                 if is_last:
                     msg += f" vlm_sft_loss={losses[-1]:.4f}"
                 print(msg, flush=True)
+            if is_last and losses:
+                logger.log(event="step", step=step_counter, epoch=epoch, loss=losses[-1])
+
+            if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:
+                path = save_checkpoint(
+                    config.checkpoint_dir, rank, peft_model, optimizer,
+                    CheckpointState(step=step_counter, epoch=epoch, batch_index=(step_counter - 1) % n_steps),
+                    keep_last=config.checkpoint_keep_last,
+                )
+                print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
 
         elapsed = time.monotonic() - t_start
         if is_last:

@@ -99,6 +99,32 @@ class DistillConfig:
     log_every: int = 4
     connect_timeout_s: int = 1800
 
+    # Reproducibility - same seed on every rank deliberately, see
+    # training_utils.set_seed's docstring.
+    seed: int = 42
+
+    # Attention implementation - see finetune.py's
+    # PipelineConfig.attn_implementation for the full story
+    # (flash_attention_2 needs flash_attn_turing_shim/ on Turing GPUs,
+    # see this repo's README). Teacher and student get INDEPENDENT
+    # fields, not one shared field - they're typically different model
+    # families/sizes (this module's own docstring), matching how
+    # quantization is already split above.
+    teacher_attn_implementation: str = "sdpa"
+    student_attn_implementation: str = "sdpa"
+
+    # Checkpoint save/resume - the STUDENT only (rank 1): the teacher is
+    # frozen/inference-only (no optimizer, nothing to resume). Same
+    # contract as finetune.py's identical fields - checkpoint_dir=None
+    # (default) disables checkpointing entirely; when set, a checkpoint
+    # already present is resumed from automatically.
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0  # steps; 0 = never checkpoint even if checkpoint_dir is set
+    checkpoint_keep_last: int = 2
+
+    # Experiment tracking - plain JSONL, see training_utils.ExperimentLogger.
+    log_path: str | None = None
+
     @classmethod
     def from_file(cls, path: str) -> "DistillConfig":
         text = Path(path).read_text()
@@ -126,7 +152,7 @@ class DistillConfig:
 
 
 def _load_full_model(model_path: str, quantization: str, config: DistillConfig, device: torch.device,
-                      lora_cfg=None):
+                      lora_cfg=None, attn_implementation: str = "sdpa"):
     """Loads a WHOLE (non-pipeline-split) causal LM onto one GPU,
     optionally quantized, optionally wrapped in LoRA. Returns (model,
     hidden_size). Unlike finetune.py's build_stage_model, there is no
@@ -148,12 +174,18 @@ def _load_full_model(model_path: str, quantization: str, config: DistillConfig, 
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype=config.torch_dtype, bnb_4bit_quant_type=config.bnb_4bit_quant_type,
         )
-        model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=bnb_cfg, device_map={"": device})
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, quantization_config=bnb_cfg, device_map={"": device}, attn_implementation=attn_implementation,
+        )
     elif quantization == "8bit":
         bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
-        model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=bnb_cfg, device_map={"": device})
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, quantization_config=bnb_cfg, device_map={"": device}, attn_implementation=attn_implementation,
+        )
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=config.torch_dtype).to(device)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=config.torch_dtype, attn_implementation=attn_implementation,
+        ).to(device)
 
     if lora_cfg is not None:
         from peft import get_peft_model
@@ -186,9 +218,16 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
     is always 2 for this module - point-to-point teacher->student, not a
     pipeline. Returns the student's per-step total-loss list (empty on
     rank 0)."""
+    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint
+
+    set_seed(config.seed)
+
     is_teacher = rank == 0
     local_gpu = rank % torch.cuda.device_count()
     device = torch.device(f"cuda:{local_gpu}")
+
+    logger = ExperimentLogger(config.log_path, rank)
+    logger.log_config(config)
 
     from transformers import AutoTokenizer
 
@@ -203,7 +242,10 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
     print(f"[rank {rank}] process group ready ({'teacher' if is_teacher else 'student'}, local GPU {local_gpu})", flush=True)
 
     if is_teacher:
-        teacher, teacher_hidden = _load_full_model(config.teacher_model_path, config.teacher_quantization, config, device)
+        teacher, teacher_hidden = _load_full_model(
+            config.teacher_model_path, config.teacher_quantization, config, device,
+            attn_implementation=config.teacher_attn_implementation,
+        )
         teacher.eval()
         teacher_vocab = teacher.config.vocab_size
         print(f"[rank {rank}] teacher loaded, hidden_size={teacher_hidden}, vocab_size={teacher_vocab}", flush=True)
@@ -215,7 +257,10 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
             r=config.student_lora_r, lora_alpha=config.student_lora_alpha,
             target_modules=config.student_lora_target_modules, lora_dropout=config.student_lora_dropout,
         )
-        student, student_hidden = _load_full_model(config.student_model_path, config.student_quantization, config, device, lora_cfg=lora_cfg)
+        student, student_hidden = _load_full_model(
+            config.student_model_path, config.student_quantization, config, device, lora_cfg=lora_cfg,
+            attn_implementation=config.student_attn_implementation,
+        )
         student_vocab = student.config.vocab_size
         n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
         print(f"[rank {rank}] student loaded, hidden_size={student_hidden}, vocab_size={student_vocab}, "
@@ -258,6 +303,40 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
     total_steps = n_steps * config.epochs
     print(f"[rank {rank}] {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps", flush=True)
 
+    # Resume - STUDENT only (rank 1): the teacher has no optimizer/
+    # trainable state to save or restore in the first place. See
+    # finetune.py's identical resume block for the full contract.
+    resume_step = 0
+    if not is_teacher and config.checkpoint_dir:
+        ckpt_state = load_checkpoint(config.checkpoint_dir, rank, student, optimizer, map_location=device)
+        if ckpt_state is not None:
+            resume_step = ckpt_state.step
+            print(f"[rank {rank}] resumed from checkpoint at step {resume_step}/{total_steps}", flush=True)
+
+    # Only the student (rank 1) has a checkpoint to read resume_step
+    # from - the teacher has no checkpoint of its own (nothing trainable
+    # to save). Without telling the teacher too, it would replay every
+    # step from 0 while the student skips ahead, desyncing their tag
+    # sequence and per-step _step_barrier calls permanently (the teacher
+    # would hang forever waiting on a barrier key the student, now many
+    # steps ahead, never reaches for that step number again). A tiny
+    # dedicated exchange (its own tag, separate from the hidden/vocab
+    # metadata exchange above) keeps both ranks' resume_step identical.
+    if not is_teacher:
+        dist.send(torch.tensor([resume_step], dtype=torch.long), dst=0, tag=1)
+    else:
+        resume_step_buf = torch.zeros(1, dtype=torch.long)
+        dist.recv(resume_step_buf, src=1, tag=1)
+        resume_step = resume_step_buf.item()
+
+    # Real bug found via finetune.py's kill-mid-run + resume test (see
+    # that module's identical fix): reusing the SAME job_id for
+    # _step_barrier's store keys across a crashed attempt and its resume
+    # can silently under-satisfy the barrier. Namespacing by resume_step
+    # guarantees a resumed attempt never touches a crashed attempt's
+    # leftover keys.
+    barrier_job_id = f"{job_id}_r{resume_step}"
+
     dist.barrier()  # real, one-shot: both ranks have finished loading before any step begins
 
     losses: list[float] = []
@@ -268,6 +347,8 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
         for b in range(n_steps):
             tag = step_counter % 8
             step_counter += 1
+            if step_counter <= resume_step:
+                continue
             block = batches[b]
             input_ids = block[:, :-1].to(device)
             labels = block[:, 1:].to(device)
@@ -314,13 +395,23 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
                 optimizer.step()
                 losses.append(loss.item())
 
-            _step_barrier(signaling_url, config, f"distill_{step_counter}", job_id=job_id)
+                if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:
+                    path = save_checkpoint(
+                        config.checkpoint_dir, rank, student, optimizer,
+                        CheckpointState(step=step_counter, epoch=epoch, batch_index=b),
+                        keep_last=config.checkpoint_keep_last,
+                    )
+                    print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
+
+            _step_barrier(signaling_url, config, f"distill_{step_counter}", job_id=barrier_job_id)
 
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if not is_teacher:
                     msg += f" loss={losses[-1]:.4f} (hard={hard_loss.item():.4f} soft={soft_loss.item():.4f} hidden={hidden_loss.item():.4f})"
                 print(msg, flush=True)
+            if not is_teacher and losses:
+                logger.log(event="step", step=step_counter, epoch=epoch, loss=losses[-1])
 
         elapsed = time.monotonic() - t_start
         if not is_teacher:

@@ -14,12 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from quic_dist.cli import run_pipeline_rank_main
 from quic_dist.finetune import PipelineConfig, run_pipeline_training
 
-config_path = sys.argv[1]
-rank = int(sys.argv[2])
-signaling_url = sys.argv[3]
-job_id = sys.argv[4] if len(sys.argv) > 4 else "pipeline_finetune"
-
-config = PipelineConfig.from_file(config_path)
-run_pipeline_training(rank, signaling_url, config, job_id=job_id)
+run_pipeline_rank_main(PipelineConfig, run_pipeline_training, default_job_id="pipeline_finetune")

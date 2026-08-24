@@ -114,6 +114,29 @@ class PretrainConfig:
     log_every: int = 8
     connect_timeout_s: int = 300
 
+    # Reproducibility - same seed on every rank deliberately, see
+    # training_utils.set_seed's docstring.
+    seed: int = 42
+
+    # Attention implementation, passed straight through to
+    # AutoModelForCausalLM.from_config - see finetune.py's
+    # PipelineConfig.attn_implementation for the full story
+    # (flash_attention_2 needs flash_attn_turing_shim/ on Turing GPUs).
+    # Confirmed empirically (not assumed) that from_config accepts this
+    # kwarg identically to from_pretrained on this project's installed
+    # transformers version.
+    attn_implementation: str = "sdpa"
+
+    # Checkpoint save/resume - every rank has real trainable params here
+    # (unlike distill.py's frozen-teacher split), so this applies
+    # uniformly, same contract as finetune.py's identical fields.
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0  # steps; 0 = never checkpoint even if checkpoint_dir is set
+    checkpoint_keep_last: int = 2
+
+    # Experiment tracking - plain JSONL, see training_utils.ExperimentLogger.
+    log_path: str | None = None
+
     @classmethod
     def from_file(cls, path: str) -> "PretrainConfig":
         text = Path(path).read_text()
@@ -168,7 +191,7 @@ def build_pretrain_stage_model(rank: int, local_gpu: int, config: PretrainConfig
         intermediate_size=config.intermediate_size,
         max_position_embeddings=config.max_position_embeddings,
     )
-    model = AutoModelForCausalLM.from_config(model_config, torch_dtype=config.torch_dtype)
+    model = AutoModelForCausalLM.from_config(model_config, torch_dtype=config.torch_dtype, attn_implementation=config.attn_implementation)
 
     device = torch.device(f"cuda:{local_gpu}")
     is_first = rank == 0
@@ -181,20 +204,40 @@ def build_pretrain_stage_model(rank: int, local_gpu: int, config: PretrainConfig
     rotary = resolve_attr(model, config.rotary_attr) if config.rotary_attr else None
     lm_head = resolve_attr(model, config.lm_head_attr)
 
+    # Real gap found while wiring checkpoint save in: nothing in this
+    # function ever restricted requires_grad, and this model has no
+    # naturally-frozen backbone (no LoRA, no quantization, no
+    # from_pretrained) - EVERY parameter defaults to requires_grad=True,
+    # including the pieces of the model that stay on CPU, unused, and
+    # never touched by this rank at all (see this function's own
+    # docstring). `training_utils.save_checkpoint` saves exactly the
+    # params with requires_grad=True, so without this fix a checkpoint
+    # would silently include the WHOLE model's random-init weights per
+    # rank, not just this rank's own slice - defeating the "trainable-
+    # params-only, stays small" design `training_utils.py`'s module
+    # docstring describes. Freeze everything first, then re-enable
+    # gradients only on the pieces actually moved to this rank's GPU.
+    model.requires_grad_(False)
+
     stage_layers = layers[my_range.start : my_range.stop]
     trainable = []
     for layer in stage_layers:
         layer.to(device)
+        layer.requires_grad_(True)
         trainable += list(layer.parameters())
     if is_first:
         embed.to(device)
+        embed.requires_grad_(True)
         trainable += list(embed.parameters())
     if is_last:
         norm.to(device)
         lm_head.to(device)
+        norm.requires_grad_(True)
+        lm_head.requires_grad_(True)
         trainable += list(norm.parameters()) + list(lm_head.parameters())
     if rotary is not None:
         rotary.to(device)
+        rotary.requires_grad_(True)
         trainable += list(rotary.parameters())  # usually none - rotary embeddings are buffers, not
                                                   # learnable weights - but harmless/correct either way
 
@@ -235,12 +278,19 @@ def build_pretrain_dataset(tokenizer, config: PretrainConfig) -> torch.Tensor:
 
 
 def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig, job_id: str = "pretrain_pipeline") -> list[float]:
+    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint
+
+    set_seed(config.seed)
+
     local_gpu = rank % torch.cuda.device_count()
     device = torch.device(f"cuda:{local_gpu}")
     is_first = rank == 0
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
     next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    logger = ExperimentLogger(config.log_path, rank)
+    logger.log_config(config)
 
     quic_dist.init_process_group(
         signaling_url=signaling_url, rank=rank, world_size=config.world_size, job_id=job_id,
@@ -259,6 +309,21 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
     print(f"[rank {rank}] pretrain: {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps "
           f"({sum(p.numel() for m in stage_layers for p in m.parameters())} local-layer params)", flush=True)
 
+    resume_step = 0
+    if config.checkpoint_dir:
+        ckpt_state = load_checkpoint(config.checkpoint_dir, rank, model, optimizer, map_location=device)
+        if ckpt_state is not None:
+            resume_step = ckpt_state.step
+            print(f"[rank {rank}] resumed from checkpoint at step {resume_step}/{total_steps}", flush=True)
+
+    # Real bug found via finetune.py's kill-mid-run + resume test (see
+    # that module's identical fix): reusing the SAME job_id for
+    # _step_barrier's store keys across a crashed attempt and its resume
+    # can silently under-satisfy the barrier. Namespacing by resume_step
+    # guarantees a resumed attempt never touches a crashed attempt's
+    # leftover keys.
+    barrier_job_id = f"{job_id}_r{resume_step}"
+
     # Real barrier before any real tensor crosses the wire - see
     # rlhf.py's run_dpo_training's identical barrier for the real cross-
     # machine timeout this prevents (a fast-loading rank starting to
@@ -272,9 +337,11 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
 
     for epoch in range(config.epochs):
         for b in range(n_steps):
-            _step_barrier(signaling_url, config, f"pretrain_{epoch}_{b}", job_id=job_id)
-            tag = step_counter % 8
             step_counter += 1
+            if step_counter <= resume_step:
+                continue  # already completed in a previous, interrupted run
+            _step_barrier(signaling_url, config, f"pretrain_{epoch}_{b}", job_id=barrier_job_id)
+            tag = step_counter % 8
             block = batches[b]
             optimizer.zero_grad()
             position_ids = torch.arange(config.seq_len, device=device).unsqueeze(0).expand(config.batch, -1)
@@ -314,6 +381,16 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
                 if is_last:
                     msg += f" loss={losses[-1]:.4f}"
                 print(msg, flush=True)
+            if is_last and losses:
+                logger.log(event="step", step=step_counter, epoch=epoch, loss=losses[-1])
+
+            if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:
+                path = save_checkpoint(
+                    config.checkpoint_dir, rank, model, optimizer,
+                    CheckpointState(step=step_counter, epoch=epoch, batch_index=b),
+                    keep_last=config.checkpoint_keep_last,
+                )
+                print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
 
         elapsed = time.monotonic() - t_start
         if is_last:

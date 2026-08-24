@@ -146,6 +146,13 @@ fn engine_config(
     }
 }
 
+/// Thin PyO3 wrapper around a single `Engine` (no dedicated background
+/// thread, no socket ownership of its own - the caller drives I/O).
+/// **Intentionally unused by `ProcessGroupQUIC`** in `quic_dist` - see
+/// `PyMultiplexedConnectionDriver`'s docstring below for what's actually
+/// used, and `driver.rs`'s module docstring for why this lower-level
+/// class is kept around anyway (a reference implementation, not dead
+/// code left over from a migration).
 #[pyclass]
 struct PyQuicEngine {
     inner: Engine,
@@ -330,7 +337,12 @@ impl PyQuicEngine {
 /// drives the ENTIRE connection lifetime - handshake, timers, GSO send,
 /// stream framing, drain-before-close - on a dedicated Rust thread. See
 /// `driver.rs`'s module docstring for the full rationale and exactly
-/// which `quic_rs_transport.py` bug fixes this ports.
+/// which `quic_rs_transport.py` bug fixes this ports. **Intentionally
+/// unused by `ProcessGroupQUIC`** in `quic_dist` - see
+/// `PyMultiplexedConnectionDriver` below for what's actually used;
+/// `driver.rs`'s own docstring explains why this single-channel driver
+/// is kept anyway (a reference implementation used to diff real bugs
+/// against, not dead code).
 #[pyclass]
 struct PyQuicConnectionDriver {
     inner: vllm_quic_engine::ConnectionDriver,

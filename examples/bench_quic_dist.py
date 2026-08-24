@@ -17,7 +17,8 @@ from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # parent of quic_dist/, for `import quic_dist`
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # this directory, for `_helpers`
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # this directory (unused today, kept for local helpers)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))  # quic_dist/tests/, for `_helpers` (SignalingServer)
 
 import torch
 
