@@ -131,6 +131,49 @@ class PipelineConfig:
     log_every: int = 16
     connect_timeout_s: int = 300
 
+    # Reproducibility - same seed on every rank deliberately, see
+    # training_utils.set_seed's docstring.
+    seed: int = 42
+
+    # Gradient accumulation - accumulate grad_accum_steps micro-batches
+    # (each config.batch examples) before optimizer.step(), for a
+    # larger effective batch size without more peak memory. 1 = off
+    # (unchanged behavior from before this field existed).
+    grad_accum_steps: int = 1
+
+    # Gradient checkpointing - trades recomputation for activation
+    # memory. Real leverage against this repo's own OOM history at
+    # large scale (qwen38_27b's linear-attention reference kernel is
+    # memory-hungry - see finetune.py's/qwen38_27b_pipeline_rank.py's
+    # history). Off by default since it slows down small/already-fitting
+    # runs for no benefit.
+    gradient_checkpointing: bool = False
+
+    # Checkpoint save/resume - model (trainable params only, so this
+    # stays small even against a large frozen base - see
+    # training_utils.py's module docstring), optimizer, RNG, and
+    # dataloader position (a step index into the pre-batched dataset).
+    # checkpoint_dir=None (default) disables checkpointing entirely -
+    # unchanged behavior from before this field existed. When set, a
+    # checkpoint already present there is resumed from AUTOMATICALLY
+    # (no separate "resume" flag to remember to flip) - the same launch
+    # command is correct whether this is a first run or a restart after
+    # a crash, which is the actual point given this project's own real
+    # crash history this session.
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0  # steps; 0 = never checkpoint even if checkpoint_dir is set
+    checkpoint_keep_last: int = 2
+
+    # Automatic evaluation - reuses a held-out TAIL slice of the same
+    # dataset (the last eval_num_examples examples, excluded from
+    # training itself) rather than requiring a second dataset config;
+    # 0 = disabled.
+    eval_every: int = 0  # steps; 0 = disabled
+    eval_num_examples: int = 0
+
+    # Experiment tracking - plain JSONL, see training_utils.ExperimentLogger.
+    log_path: str | None = None
+
     @classmethod
     def from_file(cls, path: str) -> "PipelineConfig":
         text = Path(path).read_text()
@@ -356,12 +399,51 @@ def build_dataset(tokenizer, config: PipelineConfig) -> tuple[torch.Tensor, torc
     return ids_t, mask_t
 
 
+def _forward_stage(stage_layers, hidden, position_ids, pos_emb, use_checkpoint: bool):
+    """Runs this rank's decoder layers, optionally trading compute for
+    activation memory via torch.utils.checkpoint. use_reentrant=False
+    is the modern, non-deprecated mode - it also does the right thing
+    when `hidden` doesn't itself require grad (rank 0's embed() output,
+    with a frozen embedding table) as long as
+    peft_model.enable_input_require_grads() was called first (see
+    run_pipeline_training) - that registers a forward hook directly on
+    the embed_tokens submodule, which fires regardless of whether
+    embed() is called through the full model's forward or directly, as
+    it is here."""
+    out = hidden
+    for layer in stage_layers:
+        if use_checkpoint:
+            out = torch.utils.checkpoint.checkpoint(
+                run_decoder_layer, layer, out,
+                attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb,
+                use_reentrant=False,
+            )
+        else:
+            out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+    return out
+
+
 def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig, job_id: str = "pipeline_finetune", local_gpu: int | None = None) -> list[float]:
     """Runs the full N-stage pipeline training loop for this rank and
     returns the last-stage's per-step loss list (empty on non-last
     ranks). Blocks until training completes; the caller's script is
     just this call plus argument parsing - see
-    examples/pipeline_finetune_rank.py."""
+    examples/pipeline_finetune_rank.py.
+
+    Config-gated features that don't change default behavior when left
+    unset (see PipelineConfig's own field comments for each): gradient
+    accumulation (grad_accum_steps), gradient checkpointing
+    (gradient_checkpointing), checkpoint save + automatic resume
+    (checkpoint_dir/checkpoint_every), periodic held-out evaluation
+    (eval_every/eval_num_examples), and JSONL experiment logging
+    (log_path)."""
+    from quic_dist.training_utils import (
+        set_seed, ExperimentLogger, perplexity, CheckpointState,
+        save_checkpoint, load_checkpoint,
+    )
+
+    set_seed(config.seed)
+
     if local_gpu is None:
         local_gpu = rank % torch.cuda.device_count()
     device = torch.device(f"cuda:{local_gpu}")
@@ -369,6 +451,9 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
     next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    logger = ExperimentLogger(config.log_path, rank)
+    logger.log_config(config)
 
     from transformers import AutoTokenizer
 
@@ -383,6 +468,8 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
 
     peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config)
+    if config.gradient_checkpointing:
+        peft_model.enable_input_require_grads()
 
     # Real bug found via a cross-machine 27B DPO run (rlhf.py): model
     # loading takes very different real wall-clock time per rank (disk
@@ -398,9 +485,110 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
     batches, response_masks = build_dataset(tokenizer, config)
+    # Hold out a TAIL slice for automatic evaluation rather than
+    # requiring a second dataset config - see PipelineConfig's
+    # eval_num_examples field comment.
+    n_eval_batches = (config.eval_num_examples // config.batch) if config.eval_every > 0 and config.eval_num_examples > 0 else 0
+    if n_eval_batches > 0:
+        eval_batches, eval_masks = batches[-n_eval_batches:], response_masks[-n_eval_batches:]
+        batches, response_masks = batches[:-n_eval_batches], response_masks[:-n_eval_batches]
+    else:
+        eval_batches, eval_masks = None, None
     n_steps = batches.shape[0]
     total_steps = n_steps * config.epochs
-    print(f"[rank {rank}] {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps", flush=True)
+    print(f"[rank {rank}] {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps"
+          + (f", {n_eval_batches} held-out eval batches" if n_eval_batches else ""), flush=True)
+
+    resume_step = 0
+    if config.checkpoint_dir:
+        ckpt_state = load_checkpoint(config.checkpoint_dir, rank, peft_model, optimizer, map_location=device)
+        if ckpt_state is not None:
+            resume_step = ckpt_state.step
+            print(f"[rank {rank}] resumed from checkpoint at step {resume_step}/{total_steps}", flush=True)
+
+    # Real bug found via a direct kill-mid-run + resume test: reusing
+    # the SAME job_id for _step_barrier's store keys across a crashed
+    # attempt and its resume can silently under-satisfy the barrier -
+    # if the crash left one rank's add() orphaned (only some ranks
+    # reached a given step before the crash), a resumed rank's own new
+    # add() can coincidentally land the count on exactly world_size
+    # again and set `done` before every RESUMED rank has actually
+    # arrived, per _step_barrier's own docstring. Namespacing this
+    # attempt's barrier keys by resume_step (0 for a fresh run,
+    # unchanged behavior; the checkpoint's step number after a resume)
+    # guarantees a resumed attempt never touches a crashed attempt's
+    # leftover keys.
+    barrier_job_id = f"{job_id}_r{resume_step}"
+
+    def forward_pipeline_step(block, mask, tag, use_checkpoint):
+        position_ids = torch.arange(config.seq_len, device=device).unsqueeze(0).expand(config.batch, -1)
+        if is_first:
+            input_ids = block[:, :-1].to(device)
+            # embed_tokens may be in its OWN dtype (bitsandbytes leaves
+            # it unquantized/uncast by default) - cast its output to
+            # config.torch_dtype here, once, rather than forcing
+            # embed_tokens itself to a different precision than the
+            # checkpoint intended.
+            hidden = embed(input_ids).to(config.torch_dtype)
+            hidden_in = None
+        else:
+            recv_buf = torch.zeros(config.batch, config.seq_len, hidden_size, dtype=config.torch_dtype)
+            dist.recv(recv_buf, src=prev_rank, tag=tag)
+            hidden_in = recv_buf.to(device).requires_grad_(True)
+            hidden = hidden_in
+
+        pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+        out = _forward_stage(stage_layers, hidden, position_ids, pos_emb, use_checkpoint)
+
+        if is_last:
+            labels = block[:, 1:].to(device)
+            resp_mask = mask[:, 1:].to(device).float()
+            out = norm(out)
+            # Symmetric to the embed_tokens cast above: lm_head is also
+            # left unquantized/uncast by bitsandbytes by design, so
+            # cast the ACTIVATION to lm_head's own weight dtype right
+            # here rather than forcing lm_head itself into
+            # config.torch_dtype.
+            logits = lm_head(out.to(lm_head.weight.dtype))
+            # "cpt" mode's mask is all-ones, so this is exactly the
+            # original unmasked mean cross-entropy - unchanged behavior
+            # for every existing validated config. "sft" mode's mask
+            # zeroes out prompt/pad positions, so only response tokens
+            # contribute - a real masked mean, not just zeroing the
+            # loss AFTER an unmasked mean (that would still be
+            # wrong-denominator).
+            per_token = nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(), labels.reshape(-1), reduction="none"
+            ).reshape(resp_mask.shape)
+            loss = (per_token * resp_mask).sum() / resp_mask.sum().clamp(min=1)
+            return loss, hidden_in
+        else:
+            dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+            return out, hidden_in
+
+    def eval_pass(eval_tag_prefix: str) -> float | None:
+        """Forward-only pass over the held-out slice, through the same
+        pipeline (every rank still has to participate - the pipeline
+        has no notion of "just the last rank evaluates", every stage's
+        layers are needed for a real forward). Returns the mean eval
+        loss on the last stage, None elsewhere."""
+        if eval_batches is None:
+            return None
+        peft_model.eval()
+        eval_losses = []
+        with torch.no_grad():
+            for eb in range(eval_batches.shape[0]):
+                _step_barrier(signaling_url, config, f"{eval_tag_prefix}_{eb}", job_id=barrier_job_id)
+                out, _ = forward_pipeline_step(eval_batches[eb], eval_masks[eb], tag=(100 + eb) % 8, use_checkpoint=False)
+                if is_last:
+                    eval_losses.append(out.item())
+                else:
+                    # Non-last ranks sent their activation inside
+                    # forward_pipeline_step already; nothing else to do
+                    # for a forward-only pass - no grad round trip.
+                    pass
+        peft_model.train()
+        return sum(eval_losses) / len(eval_losses) if eval_losses else None
 
     losses: list[float] = []
     t_start = time.monotonic()
@@ -408,6 +596,10 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
 
     for epoch in range(config.epochs):
         for b in range(n_steps):
+            step_counter += 1
+            if step_counter <= resume_step:
+                continue  # already completed in a previous, interrupted run
+
             # See rlhf.py's run_dpo_training's identical per-step
             # barrier for why: a rank finishing a step faster than
             # another can leave the slower rank's connection idle long
@@ -416,67 +608,56 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
             # Uses _step_barrier, NOT dist.barrier() - see that
             # function's docstring for why a second dist.barrier() call
             # is a silent no-op.
-            _step_barrier(signaling_url, config, f"sft_{epoch}_{b}", job_id=job_id)
+            _step_barrier(signaling_url, config, f"sft_{epoch}_{b}", job_id=barrier_job_id)
             tag = step_counter % 8
-            step_counter += 1
             block = batches[b]
             mask = response_masks[b]
-            optimizer.zero_grad()
-            position_ids = torch.arange(config.seq_len, device=device).unsqueeze(0).expand(config.batch, -1)
 
-            if is_first:
-                input_ids = block[:, :-1].to(device)
-                # embed_tokens may be in its OWN dtype (bitsandbytes
-                # leaves it unquantized/uncast by default) - cast its
-                # output to config.torch_dtype here, once, rather than
-                # forcing embed_tokens itself to a different precision
-                # than the checkpoint intended.
-                hidden = embed(input_ids).to(config.torch_dtype)
-            else:
-                recv_buf = torch.zeros(config.batch, config.seq_len, hidden_size, dtype=config.torch_dtype)
-                dist.recv(recv_buf, src=prev_rank, tag=tag)
-                hidden = recv_buf.to(device).requires_grad_(True)
+            is_accum_start = (step_counter - 1) % config.grad_accum_steps == 0
+            is_accum_end = (step_counter % config.grad_accum_steps == 0) or (step_counter == total_steps)
+            if is_accum_start:
+                optimizer.zero_grad()
 
-            pos_emb = rotary(hidden, position_ids) if rotary is not None else None
-            out = hidden
-            for layer in stage_layers:
-                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+            loss_or_out, hidden_in = forward_pipeline_step(block, mask, tag, use_checkpoint=config.gradient_checkpointing)
 
             if is_last:
-                labels = block[:, 1:].to(device)
-                resp_mask = mask[:, 1:].to(device).float()
-                out = norm(out)
-                # Symmetric to the embed_tokens cast above: lm_head is
-                # also left unquantized/uncast by bitsandbytes by
-                # design, so cast the ACTIVATION to lm_head's own
-                # weight dtype right here rather than forcing lm_head
-                # itself into config.torch_dtype.
-                logits = lm_head(out.to(lm_head.weight.dtype))
-                # "cpt" mode's mask is all-ones, so this is exactly the
-                # original unmasked mean cross-entropy - unchanged
-                # behavior for every existing validated config. "sft"
-                # mode's mask zeroes out prompt/pad positions, so only
-                # response tokens contribute - a real masked mean, not
-                # just zeroing the loss AFTER an unmasked mean (that
-                # would still be wrong-denominator).
-                per_token = nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]).float(), labels.reshape(-1), reduction="none"
-                ).reshape(resp_mask.shape)
-                loss = (per_token * resp_mask).sum() / resp_mask.sum().clamp(min=1)
-                loss.backward()
+                loss = loss_or_out
+                (loss / config.grad_accum_steps).backward()
                 losses.append(loss.item())
             else:
-                dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+                out = loss_or_out
                 grad = torch.zeros(config.batch, config.seq_len, hidden_size, dtype=config.torch_dtype)
                 dist.recv(grad, src=next_rank, tag=tag)
                 out.backward(grad.to(device))
 
             if not is_first:
-                dist.send(hidden.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
+                dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
 
-            optimizer.step()
+            if is_accum_end:
+                optimizer.step()
+
             if step_counter <= 3 or step_counter % config.log_every == 0:
-                print(f"[rank {rank}] step {step_counter}/{total_steps}", flush=True)
+                msg = f"[rank {rank}] step {step_counter}/{total_steps}"
+                if is_last:
+                    msg += f" loss={losses[-1]:.4f} ppl={perplexity(losses[-1]):.2f}"
+                print(msg, flush=True)
+            if is_last:
+                logger.log(event="step", step=step_counter, epoch=epoch, loss=losses[-1] if losses else None,
+                            perplexity=perplexity(losses[-1]) if losses else None)
+
+            if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:
+                path = save_checkpoint(
+                    config.checkpoint_dir, rank, peft_model, optimizer,
+                    CheckpointState(step=step_counter, epoch=epoch, batch_index=b),
+                    keep_last=config.checkpoint_keep_last,
+                )
+                print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
+
+            if config.eval_every > 0 and eval_batches is not None and step_counter % config.eval_every == 0:
+                eval_loss = eval_pass(f"eval_{step_counter}")
+                if is_last and eval_loss is not None:
+                    print(f"[rank {rank}] step {step_counter} eval_loss={eval_loss:.4f} eval_ppl={perplexity(eval_loss):.2f}", flush=True)
+                    logger.log(event="eval", step=step_counter, eval_loss=eval_loss, eval_perplexity=perplexity(eval_loss))
 
         elapsed = time.monotonic() - t_start
         if is_last:

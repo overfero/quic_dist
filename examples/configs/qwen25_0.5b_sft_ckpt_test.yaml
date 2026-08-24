@@ -1,0 +1,40 @@
+# Validation config for the new training_utils.py-backed features
+# (checkpoint save/resume, gradient accumulation, gradient
+# checkpointing, periodic held-out eval, JSONL logging) - NOT a
+# real/representative training recipe, deliberately tiny and fast.
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen25_0.5b_sft_ckpt_test.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16
+
+training_mode: sft
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 40
+prompt_field: instruction
+response_field: output
+
+seq_len: 64
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 1
+
+seed: 1234
+grad_accum_steps: 2
+gradient_checkpointing: true
+checkpoint_dir: /tmp/ckpt_test_0.5b
+checkpoint_every: 4
+checkpoint_keep_last: 2
+eval_every: 4
+eval_num_examples: 8
+log_path: /tmp/ckpt_test_0.5b/train_log.jsonl

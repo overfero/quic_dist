@@ -183,6 +183,76 @@ directly-run scripts (`cross_machine_rank.py`, `lora_pipeline_rank.py`,
 plus the `configs/` and `data/` they read from - run one instance per
 machine/rank, pointed at a real publicly reachable signaling URL.
 
+## Training infrastructure checklist
+
+Ordered lightest -> heaviest by implementation weight; items marked
+**[transport]** touch quic_dist's own send/recv/barrier path
+(`process_group.py` / the Rust engine) - everything else is
+training-loop-local bookkeeping and carries no transport risk. `[x]`
+done and validated with a real run (see each item's note); `[ ]` not
+yet done.
+
+- [x] **Reproducible config (seeding)** - `training_utils.set_seed()`,
+  same seed on every rank. `PipelineConfig.seed`/`RLHFModelConfig.seed`.
+- [x] **Experiment tracking (loss, perplexity)** - `training_utils.ExperimentLogger`,
+  plain JSONL, `config.log_path`. Includes a config snapshot at the
+  start of the log.
+- [x] **Gradient accumulation** - `config.grad_accum_steps` in `finetune.py`.
+- [x] **Gradient checkpointing** - `config.gradient_checkpointing` in
+  `finetune.py` (`torch.utils.checkpoint`, `use_reentrant=False`, with
+  `peft_model.enable_input_require_grads()` for the frozen-embedding
+  case).
+- [x] **Distributed checkpoint save/resume** (model=trainable params
+  only, optimizer state, RNG state, dataloader/step position) -
+  `training_utils.save_checkpoint`/`load_checkpoint`, `config.checkpoint_dir`/
+  `checkpoint_every`/`checkpoint_keep_last`. Resuming is automatic
+  (the same launch command works for a first run or a restart) -
+  validated with a real kill-mid-run-then-relaunch test on
+  `finetune.py`'s SFT/CPT path: the resumed run reproduced the exact
+  same losses the killed run had already logged for the steps it
+  re-entered (bit-identical, confirming the RNG state genuinely
+  restored, not just "training continued somehow"). A real bug was
+  found and fixed by this test: `torch.load(..., map_location=<cuda
+  device>)` relocates the saved RNG state tensors to the GPU too,
+  which `torch.set_rng_state`/`torch.cuda.set_rng_state_all` then
+  reject - fixed by forcing those specific tensors back to CPU
+  regardless of the checkpoint's overall `map_location`. A second real
+  bug: reusing the same `job_id` across a crashed attempt and its
+  resume can let `_step_barrier`'s per-step store keys collide with
+  the crashed attempt's leftover (possibly only-partially-satisfied)
+  state - fixed by namespacing each attempt's barrier keys with its
+  resume step number.
+- [x] **Automatic evaluation after checkpoint** - `config.eval_every`/
+  `eval_num_examples` in `finetune.py`, a held-out TAIL slice of the
+  same dataset (no second dataset config needed), forward-only through
+  the same pipeline, logged as `eval_loss`/`eval_perplexity`.
+- [x] Reference wiring above is `finetune.py` (SFT/CPT); `rlhf.py`'s
+  `run_dpo_training` has seed/logging/checkpoint+resume too (also
+  validated with a real run), proving the utilities generalize beyond
+  one training mode.
+- [ ] Wire seed/logging/checkpoint+resume into `rlhf.py`'s remaining
+  modes (GRPO, PPO, RLOO, RM, PRM) and into `distill.py`/`pretrain.py` -
+  same utilities, not yet threaded through each loop individually.
+- [ ] **Mixed precision** - arguably already the case in spirit
+  (compute at `config.compute_dtype`, loss/softmax explicitly cast to
+  fp32 - see `finetune.py`'s dtype-boundary comments) but not a formal
+  `torch.autocast` wrapping; not attempted given the existing
+  bitsandbytes-quantized layers' own internal dtype handling.
+- [ ] **Benchmark integration** - a standard external eval (e.g. a
+  fixed perplexity benchmark corpus) beyond the in-repo held-out-slice
+  eval above.
+- [ ] **Flash attention** - real install-complexity risk in this
+  environment (a compiled dependency), and uncertain benefit for
+  `qwen38_27b`'s hybrid architecture specifically (its
+  `linear_attention` blocks use a different mechanism entirely,
+  unaffected by flash attention's `full_attention`-only speedup).
+- [ ] **Communication/computation overlap** [transport] - overlapping a
+  micro-batch's async QUIC send with the next micro-batch's compute
+  (CUDA streams + async Rust-side scheduling). Real engineering scope
+  in `process_group.py` and likely the Rust engine's dispatch loop, not
+  a training-loop config flag - scoped separately from the
+  training-loop-local items above.
+
 ## Known limitations
 
 See the full deliverable report for the complete architecture, design

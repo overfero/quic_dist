@@ -85,6 +85,18 @@ class RLHFModelConfig:
     log_every: int = 8
     lr: float = 1e-4
 
+    # Reproducibility, checkpoint save/resume, and experiment logging -
+    # same semantics and defaults as finetune.PipelineConfig's identical
+    # fields (see there for the full rationale); wired into
+    # run_dpo_training below as the reference RLHF implementation.
+    # checkpoint_dir=None/log_path=None (defaults) = both fully
+    # disabled, unchanged behavior from before these fields existed.
+    seed: int = 42
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0
+    checkpoint_keep_last: int = 2
+    log_path: str | None = None
+
     @classmethod
     def _load_raw(cls, path: str) -> dict:
         text = Path(path).read_text()
@@ -264,6 +276,13 @@ def _sequence_logp(logits, labels, mask):
 
 def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: str = "dpo_pipeline") -> list[float]:
     from transformers import AutoTokenizer
+    from quic_dist.training_utils import (
+        set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint,
+    )
+
+    set_seed(config.seed)
+    logger = ExperimentLogger(config.log_path, rank)
+    logger.log_config(config)
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
     if tokenizer.pad_token is None:
@@ -298,6 +317,19 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
     seq_len = config.seq_len - 1  # predicting next-token, same -1 convention as finetune.py
     print(f"[rank {rank}] DPO: {config.epochs} epochs x {n_steps} steps/epoch = {total_steps} steps, "
           f"pipeline batch {pbatch} (={config.batch} pairs x2)", flush=True)
+
+    resume_step = 0
+    if config.checkpoint_dir:
+        ckpt_state = load_checkpoint(config.checkpoint_dir, rank, peft_model, optimizer, map_location=device)
+        if ckpt_state is not None:
+            resume_step = ckpt_state.step
+            print(f"[rank {rank}] resumed from checkpoint at step {resume_step}/{total_steps}", flush=True)
+
+    # See finetune.py's identical comment: namespaces this attempt's
+    # _step_barrier keys by resume_step so a resumed run never touches
+    # a crashed attempt's leftover (possibly orphaned/under-satisfied)
+    # barrier state for the same job_id.
+    barrier_job_id = f"{job_id}_r{resume_step}"
 
     losses: list[float] = []
     t_start = time.monotonic()
@@ -336,6 +368,10 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
 
     for epoch in range(config.epochs):
         for b in range(n_steps):
+            if epoch * n_steps + b + 1 <= resume_step:
+                step_counter = epoch * n_steps + b + 1
+                continue  # already completed in a previous, interrupted run
+
             # Real bug found via a cross-machine 27B GRPO run (same
             # class as the load-time barrier, different location): one
             # rank finishing a step's bookkeeping faster than another
@@ -348,7 +384,7 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
             # even though this exact run didn't fail. Uses _step_barrier,
             # NOT dist.barrier() - see that function's docstring for why
             # a second dist.barrier() call is a silent no-op.
-            _step_barrier(signaling_url, config, f"dpo_{epoch}_{b}", job_id=job_id)
+            _step_barrier(signaling_url, config, f"dpo_{epoch}_{b}", job_id=barrier_job_id)
             step_counter += 1
             tag_ref = (step_counter % 4) * 2
             tag_policy = tag_ref + 1
@@ -393,6 +429,18 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
                 if is_last:
                     msg += f" dpo_loss={losses[-1]:.4f} margin={(pol_chosen-pol_rejected).mean().item():.3f}"
                 print(msg, flush=True)
+            if is_last:
+                logger.log(event="step", step=step_counter, epoch=epoch,
+                            loss=losses[-1] if losses else None,
+                            margin=(pol_chosen - pol_rejected).mean().item() if losses else None)
+
+            if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:
+                path = save_checkpoint(
+                    config.checkpoint_dir, rank, peft_model, optimizer,
+                    CheckpointState(step=step_counter, epoch=epoch, batch_index=b),
+                    keep_last=config.checkpoint_keep_last,
+                )
+                print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
 
         elapsed = time.monotonic() - t_start
         if is_last:
