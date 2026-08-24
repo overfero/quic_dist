@@ -279,23 +279,46 @@ yet done.
   `rlhf.py`'s `RLHFModelConfig` got the same field since it reuses
   `build_stage_model` via duck typing).
 
-  **Honest end-to-end result, not oversold**: despite the real 1.27x
-  isolated-kernel speedup, a direct A/B on an actual training run
-  (Qwen2.5-0.5B, 2-stage pipeline) showed NO end-to-end win at this
-  project's actual scale - seq_len=128: 19.3s (sdpa) vs. 22.1s (flash,
-  SLOWER); seq_len=512: 22.6s both (tied). Loss matched closely both
-  times (3.0505 vs 3.0512 at seq_len=128), confirming correctness held
-  in the real training loop, not just the isolated kernel test - the
-  lack of speedup is a real scale finding, not a broken integration.
-  At this model size and batch/seq_len, attention isn't the training
-  step's bottleneck, so a faster attention kernel alone doesn't move
-  total wall-clock time. Kept as a real, validated, opt-in capability
+  **Honest end-to-end result, not oversold, AND scale-dependent -
+  measured at two real sizes, not just one**:
+  - Qwen2.5-0.5B, 2-stage pipeline: NO end-to-end win - seq_len=128:
+    19.3s (sdpa) vs. 22.1s (flash, SLOWER); seq_len=512: 22.6s both
+    (tied). At this size, attention isn't the training step's
+    bottleneck, so a faster attention kernel alone doesn't move total
+    wall-clock time.
+  - Qwen2.5-7B, 2-stage pipeline, seq_len=1024, a genuine apples-to-
+    apples A/B (both runs `cpu_offload_unused_layers=false`, since
+    `transformers`' flash_attention_2 path rejects any device_map
+    containing `"cpu"` entries - see the real incompatibility noted
+    below, found via a direct crash, not assumed): 243.3s (sdpa) vs.
+    238.6s (flash) - a real, if modest, ~2% WIN this time. Loss matched
+    closely at both sizes (3.0505 vs 3.0512 at 0.5B/seq_len=128; 2.7185
+    vs. 2.7179 at 7B), confirming correctness held throughout, not just
+    in the isolated kernel test.
+
+  The crossover is the real finding: attention is a small fraction of
+  the step at 0.5B/short-context, big enough to matter at 7B/seq_len
+  1024. Kept as a real, validated, opt-in capability
   (`examples/configs/qwen25_0.5b_lora_flash_attn.yaml`) - worth
-  revisiting at a larger model or longer context where attention is a
-  bigger fraction of the step, which this project hasn't tested. Not
-  useful for `qwen38_27b`'s hybrid architecture regardless of scale -
-  its `linear_attention` blocks use a completely different mechanism,
-  unaffected by flash attention's `full_attention`-only speedup.
+  testing at even larger scale/longer context, which this project
+  hasn't done. Not useful for `qwen38_27b`'s hybrid architecture
+  regardless of scale - its `linear_attention` blocks use a completely
+  different mechanism, unaffected by flash attention's
+  `full_attention`-only speedup.
+
+  **Real, found-not-assumed incompatibility**: `transformers`'
+  `flash_attention_2` loading path raises `ValueError` on ANY
+  device_map containing a `"cpu"` entry - which is exactly what
+  `cpu_offload_unused_layers=True` relies on (the mechanism that lands
+  "other ranks' layers" on the meta device at ~0 real memory for larger
+  models split across a pipeline - see `build_device_map()`'s
+  docstring). So `attn_implementation: flash_attention_2` currently
+  only works for configs that don't need that offload - either a small
+  enough model that each rank can afford to hold the WHOLE thing
+  redundantly (what both A/B tests above actually did - a 7B model in
+  4bit is only ~3.5GB, comfortably fits per-rank on a 15GB T4 even
+  loaded twice), or a future change to route "other" layers somewhere
+  flash_attention_2 accepts instead of `"cpu"`.
 - [x] **Communication/computation overlap** - turned out NOT to need
   Rust work, correcting an earlier wrong assumption in this checklist:
   `process_group.py`'s `isend`/`irecv` (`work.py`, a genuine background-
