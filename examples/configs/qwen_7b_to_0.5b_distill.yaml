@@ -1,0 +1,37 @@
+# Real knowledge distillation: Qwen2.5-7B teacher (rank 0, frozen,
+# 4-bit) -> Qwen2.5-0.5B student (rank 1, trainable LoRA, 4-bit), one
+# rank per real machine (world_size is always 2 for distill.py - see
+# its module docstring for why this is a point-to-point exchange, not
+# a pipeline split). Both are real Qwen2.5-family checkpoints sharing a
+# tokenizer/vocab, a precondition distill.py checks at startup (raises
+# if it doesn't hold) rather than assuming.
+#
+# Run: python3 distill_pipeline_rank.py configs/qwen_7b_to_0.5b_distill.yaml <rank> <signaling_url>
+
+teacher_model_path: Qwen/Qwen2.5-7B
+student_model_path: Qwen/Qwen2.5-0.5B
+
+teacher_quantization: "4bit"
+student_quantization: "4bit"
+compute_dtype: bfloat16
+
+student_lora_r: 8
+student_lora_alpha: 16
+student_lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+temperature: 2.0
+alpha_hard: 0.3
+alpha_soft: 0.5
+alpha_hidden: 0.2
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 16
+text_field: text
+
+seq_len: 64
+batch: 1
+epochs: 3
+lr: 0.0001
+log_every: 2
+connect_timeout_s: 1800

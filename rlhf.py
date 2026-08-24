@@ -118,7 +118,7 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
     return local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
-def _step_barrier(signaling_url, config, tag: str, timeout_s: int = 300):
+def _step_barrier(signaling_url, config, tag: str, job_id: str = "", timeout_s: int = 300):
     """A REAL per-step barrier - unlike `dist.barrier()`, which is only
     safe to call ONCE per process group's lifetime. Found via a real
     cross-machine GRPO run: PyTorch's own `_store_based_barrier` keys
@@ -132,11 +132,30 @@ def _step_barrier(signaling_url, config, tag: str, timeout_s: int = 300):
     existing load-time one did not fix the timeout it was meant to fix.
     This reimplements the same add-then-wait-for-last-worker pattern
     directly against the store, with a fresh key per `tag` so each call
-    is genuinely independent of every other barrier in the run."""
+    is genuinely independent of every other barrier in the run.
+
+    `job_id` is included in the key on top of `tag` - found via a real
+    hang (distillation module, world_size=2): the signaling server's
+    `/kv/*` store is shared across EVERY run that ever points at it, not
+    scoped per process group. Two DIFFERENT runs that happen to reach
+    the same `tag` (e.g. both hit "distill_1" - trivially likely across
+    repeated dev-loop restarts against one long-lived local signaling
+    server) silently share the same counter key. A crashed/killed EARLIER
+    run's orphaned `add()` calls accumulate on that key forever (nothing
+    ever consumes/resets it), pushing the count past `config.world_size`
+    - and since the check is `count == world_size` (exact equality, not
+    `>=`), a THIS-run's count that lands on an already-inflated key can
+    permanently miss the equality and every rank hangs until its own
+    300s timeout, even though both ranks genuinely reached the barrier.
+    Confirmed directly: the signaling server's access log showed 20
+    accumulated `/kv/add` calls against one `tag` from earlier crashed
+    attempts before the hang. Scoping by `job_id` (already unique per
+    run in every caller here) prevents different runs from ever sharing
+    a key, independent of what `tag` values they happen to reach."""
     from quic_dist.store import QuicRendezvousStore
 
     store = QuicRendezvousStore(signaling_url, timeout=timedelta(seconds=timeout_s))
-    key = f"step_barrier_{tag}"
+    key = f"step_barrier_{job_id}_{tag}"
     count = store.add(key, 1)
     if count == config.world_size:
         store.set(f"{key}:done", "1")
@@ -329,7 +348,7 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
             # even though this exact run didn't fail. Uses _step_barrier,
             # NOT dist.barrier() - see that function's docstring for why
             # a second dist.barrier() call is a silent no-op.
-            _step_barrier(signaling_url, config, f"dpo_{epoch}_{b}")
+            _step_barrier(signaling_url, config, f"dpo_{epoch}_{b}", job_id=job_id)
             step_counter += 1
             tag_ref = (step_counter % 4) * 2
             tag_policy = tag_ref + 1
@@ -520,7 +539,7 @@ def run_rm_training(rank: int, signaling_url: str, config: RMConfig, job_id: str
 
     for epoch in range(config.epochs):
         for b in range(n_steps):
-            _step_barrier(signaling_url, config, f"rm_{epoch}_{b}")
+            _step_barrier(signaling_url, config, f"rm_{epoch}_{b}", job_id=job_id)
             step_counter += 1
             tag = step_counter % 8
             block = input_ids_all[b]
@@ -749,7 +768,7 @@ def run_prm_training(rank: int, signaling_url: str, config: PRMConfig, job_id: s
 
     for epoch in range(config.epochs):
         for ex in examples:
-            _step_barrier(signaling_url, config, f"prm_{step_counter}")
+            _step_barrier(signaling_url, config, f"prm_{step_counter}", job_id=job_id)
             step_counter += 1
             tag = step_counter % 8
             input_ids = ex["input_ids"].unsqueeze(0)  # (1, T)
@@ -1218,7 +1237,7 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
             # actual root cause of the real timeout observed here, not
             # just a plausible-sounding guess - a first attempt using
             # plain dist.barrier() here did NOT fix the crash).
-            _step_barrier(signaling_url, config, f"grpo_{step_counter + 1}")
+            _step_barrier(signaling_url, config, f"grpo_{step_counter + 1}", job_id=job_id)
             step_counter += 1
             tag_gen = (step_counter % 4) * 3
             tag_ref = tag_gen + 1
@@ -1476,7 +1495,7 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
             # per-step barrier for why this is _step_barrier and NOT
             # plain dist.barrier() (which is a silent no-op past the
             # first call in a process group's lifetime).
-            _step_barrier(signaling_url, config, f"ppo_{step_counter + 1}")
+            _step_barrier(signaling_url, config, f"ppo_{step_counter + 1}", job_id=job_id)
             step_counter += 1
             tag_gen = (step_counter % 3) * (2 + config.ppo_epochs)
             tag_ref = tag_gen + 1
