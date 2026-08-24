@@ -12,7 +12,7 @@ natively on GitHub.
 flowchart TB
     user["User code<br/>(any torch.distributed script)"]
     init["quic_dist.init_process_group()"]
-    pg["ProcessGroupQUIC<br/>(process_group.py, backend id &quot;quic&quot;)"]
+    pg["ProcessGroupQUIC<br/>(process_group.py, backend id: quic)"]
     store["QuicRendezvousStore<br/>(store.py, a torch.distributed.Store)"]
     peer["holepunch/peer.py<br/>(UDP hole-punch client, vendored)"]
     sig["holepunch/signaling_server.py<br/>(one HTTP process, two unrelated APIs)"]
@@ -24,7 +24,7 @@ flowchart TB
     init --> store
     store -- "/kv/set /kv/get /kv/add /kv/compare_set<br/>(pre-ProcessGroup rendezvous + barrier)" --> sig
     pg -- "_connect_to_peer()" --> peer
-    peer -- "/register  GET /peer/{id}<br/>(endpoint exchange + punch timing)" --> sig
+    peer -- "/register, GET /peer/peer_id<br/>(endpoint exchange + punch timing)" --> sig
     peer -- "hands off the punched socket" --> driver
     pg -- "send/recv/isend/irecv per tag" --> driver
     driver --> udp
@@ -63,9 +63,9 @@ sequenceDiagram
 
     A->>S: POST /register (self_id, udp_port)
     B->>S: POST /register (self_id, udp_port)
-    A->>S: GET /peer/{B} (poll until B has registered)
+    A->>S: GET /peer/B (poll until B has registered)
     S-->>A: B's public ip/port + synchronized punch start_at
-    B->>S: GET /peer/{A} (same, symmetric)
+    B->>S: GET /peer/A (same, symmetric)
     S-->>B: A's public ip/port + synchronized punch start_at
 
     par UDP hole punch (holepunch/peer.py, both sides)
