@@ -147,6 +147,21 @@ first/last 8 of 48 steps, 3 epochs), and CONFIRMED CROSS-MACHINE (2 real
 machines, one real network hop) with the same result - loss trajectory
 matched the loopback run step-for-step, 206.8s total.
 
+Scaled up and CONFIRMED CROSS-MACHINE at real ~7B scale too:
+`llava-hf/llava-1.5-7b-hf` (CLIP ViT-L/14 + Llama-7B, 32 layers, QLoRA,
+`configs/llava_v15_7b_multimodal.yaml`) - a genuinely different decoder
+family and vision tower than the 0.5B proof, module structure
+reconfirmed by direct inspection rather than assumed. 36 real steps (3
+epochs), loss 2.76 → 1.77 (avg first/last 8 steps), 79s total on the
+cross-machine run. Two more real per-checkpoint gotchas found via live
+runs at this scale (both now called out directly in the config's own
+comments so they're not rediscovered): `image_token_id` differs per
+checkpoint (151646 for the 0.5B Qwen proof, 32000 for this one - the
+module's default matches only the first), and `compute_dtype` must
+match the checkpoint's real native dtype (this one is float16, not the
+0.5B proof's bfloat16) - both are real, direct crashes if wrong, not
+silent degradations.
+
 ## Tests
 
 ```bash

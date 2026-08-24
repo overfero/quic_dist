@@ -1,0 +1,54 @@
+# Scale-up of llava_qwen05b_multimodal.yaml's proof to a real ~7B VLM:
+# llava-hf/llava-1.5-7b-hf (CLIP ViT-L/14 vision tower + Llama-7B
+# decoder, 32 layers). Confirmed via direct empirical inspection (not
+# assumed from the 0.5B proof) that this checkpoint's module structure
+# matches multimodal.py's PLAIN defaults exactly - model.language_model.
+# {layers,embed_tokens,norm,rotary_emb}, model.vision_tower,
+# model.multi_modal_projector, top-level lm_head - same as the 0.5B
+# LLaVA-Qwen checkpoint despite the totally different decoder family
+# (Llama vs Qwen2), because both use HF's shared Llava wrapper class.
+# CLIP's attention also names its output projection `out_proj` (not
+# `o_proj`), so lora_target_modules below still only touches the
+# language model, not the vision tower - same protection as the 0.5B
+# config, reconfirmed for this checkpoint specifically.
+#
+# Real 2-machine topology (world_size=2, ONE rank per machine, unlike
+# the 27B text run's 4-rank/2-GPU-per-machine setup) - matches
+# qwen25_7b_sft.yaml/qwen25_7b_ppo.yaml's already-confirmed real
+# cross-machine topology for this model scale. QLoRA (4bit) needed here
+# (unlike the 0.5B proof's quantization: none) - a 7B model doesn't fit
+# a T4 unquantized.
+#
+# Run: python3 multimodal_pipeline_rank.py configs/llava_v15_7b_multimodal.yaml <rank> <signaling_url>
+
+model_path: llava-hf/llava-1.5-7b-hf
+world_size: 2
+num_layers: 32
+image_token_id: 32000  # this checkpoint's real value (confirmed via AutoConfig) -
+                        # DIFFERENT from the 0.5B LLaVA-Qwen proof's 151646, a real
+                        # crash found via a live run: image_token_id defaults to the
+                        # 0.5B config's value, so every VLM config MUST set its own.
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16  # this checkpoint's real native dtype (confirmed via
+                         # AutoConfig.torch_dtype) - DIFFERENT from the 0.5B
+                         # LLaVA-Qwen proof's bfloat16. A real crash found via
+                         # a live run: RuntimeError float != c10::Half inside
+                         # rank1's own q_proj - the base LoRA layer's real
+                         # weight dtype (float16) didn't match the bfloat16
+                         # activation this config was casting everything to.
+cpu_offload_unused_layers: true
+connect_timeout_s: 1800
+
+dataset_name: HuggingFaceH4/llava-instruct-mix-vsft
+dataset_split: train
+num_examples: 12
+max_len: 1024
+
+epochs: 3
+lr: 0.0001
+log_every: 2
