@@ -241,17 +241,46 @@ yet done.
 - [ ] **Benchmark integration** - a standard external eval (e.g. a
   fixed perplexity benchmark corpus) beyond the in-repo held-out-slice
   eval above.
-- [ ] **Flash attention** - real install-complexity risk in this
-  environment (a compiled dependency), and uncertain benefit for
-  `qwen38_27b`'s hybrid architecture specifically (its
-  `linear_attention` blocks use a different mechanism entirely,
-  unaffected by flash attention's `full_attention`-only speedup).
-- [ ] **Communication/computation overlap** [transport] - overlapping a
-  micro-batch's async QUIC send with the next micro-batch's compute
-  (CUDA streams + async Rust-side scheduling). Real engineering scope
-  in `process_group.py` and likely the Rust engine's dispatch loop, not
-  a training-loop config flag - scoped separately from the
-  training-loop-local items above.
+- [ ] **Flash attention** - attempted, real failure, not just a
+  theoretical risk: `pip install flash-attn --no-build-isolation`
+  actually built a wheel successfully in this environment (~2-3 min,
+  faster than expected), but the compiled extension fails to import -
+  `undefined symbol: _ZN3c105Error...`, a C++ ABI mismatch between the
+  extension and the installed torch build (a well-known flash-attn pain
+  point - it needs a wheel built against the EXACT torch/CUDA/ABI combo
+  in use, not just "a torch"). Uninstalled rather than left broken.
+  Chasing a working combination wasn't pursued further given it
+  wouldn't help `qwen38_27b`'s hybrid architecture anyway - its
+  `linear_attention` blocks use a completely different mechanism,
+  unaffected by flash attention's `full_attention`-only speedup, which
+  is the model this repo's largest real proof actually uses.
+- [x] **Communication/computation overlap** - turned out NOT to need
+  Rust work, correcting an earlier wrong assumption in this checklist:
+  `process_group.py`'s `isend`/`irecv` (`work.py`, a genuine background-
+  thread + `torch.futures.Future` implementation, its own docstring
+  already states its purpose is exactly this) already existed and were
+  already validated - what was missing was the TRAINING LOOP using
+  them. `finetune.py`'s `config.overlap_communication` converts the
+  forward-activation send (non-last ranks) and backward-gradient send
+  (non-first ranks) from blocking `send` to `isend`, deferring the wait
+  on each one until right before the NEXT send of the same kind (or
+  teardown) - so the calling thread moves on to its next blocking call
+  instead of idling through the hand-off. Validated on a real 0.5B run
+  BOTH loopback and real cross-machine (local <-> a real remote GCP
+  box, genuine hole-punch, `grad_accum_steps` 8 loopback / 4 cross-
+  machine): correctness held both times - bit-identical mean loss with
+  the flag on vs. off (4.6165 loopback, 4.1430 cross-machine), not just
+  "didn't crash". Timing: loopback 32.4s vs. 33.5s (~3%), cross-machine
+  39.1s vs. 41.2s (~5%) - a real, if modest, win both times, slightly
+  larger cross-machine as expected (more actual network latency to
+  hide behind deferred waits). The modesty is an honest, expected
+  consequence of this architecture's own per-step `_step_barrier`
+  forcing every rank back into lockstep each micro-step (see that
+  function's docstring) - genuine multi-micro-batch staggering
+  (removing that barrier for a true streaming pipeline) would very
+  likely show a much larger effect, especially over a higher-RTT link,
+  but that's a materially bigger, riskier restructuring than this flag -
+  not attempted here.
 
 ## Known limitations
 

@@ -141,6 +141,23 @@ class PipelineConfig:
     # (unchanged behavior from before this field existed).
     grad_accum_steps: int = 1
 
+    # Communication/computation overlap - uses quic_dist's REAL async
+    # isend (process_group.py, backed by work.py's genuine background-
+    # thread + torch.futures.Future implementation - not a training-loop
+    # concept, the transport primitive already existed and was already
+    # validated before this flag did) for the forward-activation send
+    # (non-last ranks) and the backward-gradient send (non-first ranks),
+    # instead of the blocking `send`. The calling thread hands the
+    # tensor to a background thread and moves straight on to its next
+    # blocking call (recv, or the next micro-batch's forward) rather
+    # than waiting for that hand-off to fully complete first; the
+    # PREVIOUS pending isend of the same kind is waited on (so at most
+    # one is ever in flight per direction, and a real transport error
+    # surfaces promptly rather than being silently dropped) right before
+    # issuing a new one, and any still-pending sends are drained before
+    # teardown. False (default) = unchanged blocking `send` behavior.
+    overlap_communication: bool = False
+
     # Gradient checkpointing - trades recomputation for activation
     # memory. Real leverage against this repo's own OOM history at
     # large scale (qwen38_27b's linear-attention reference kernel is
@@ -520,6 +537,29 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     # leftover keys.
     barrier_job_id = f"{job_id}_r{resume_step}"
 
+    # Single-slot-per-direction pending isend tracking for
+    # overlap_communication - see PipelineConfig.overlap_communication's
+    # docstring. A plain dict (not separate `nonlocal` locals) so both
+    # forward_pipeline_step and the main loop below can share it without
+    # each needing its own nonlocal declaration.
+    pending_sends: dict[str, "dist.Work | None"] = {"fwd": None, "grad": None}
+
+    def _isend_with_lookback(tensor, dst, tag, kind: str):
+        """Waits on the PREVIOUS pending send of this kind (if any) -
+        surfacing its error now, if it had one, rather than never - then
+        fires this one asynchronously and stashes it as the new
+        pending send. Called only when config.overlap_communication."""
+        prev = pending_sends[kind]
+        if prev is not None:
+            prev.wait()
+        pending_sends[kind] = dist.isend(tensor, dst=dst, tag=tag)
+
+    def _drain_pending_sends():
+        for kind, work in pending_sends.items():
+            if work is not None:
+                work.wait()
+                pending_sends[kind] = None
+
     def forward_pipeline_step(block, mask, tag, use_checkpoint):
         position_ids = torch.arange(config.seq_len, device=device).unsqueeze(0).expand(config.batch, -1)
         if is_first:
@@ -563,7 +603,11 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
             loss = (per_token * resp_mask).sum() / resp_mask.sum().clamp(min=1)
             return loss, hidden_in
         else:
-            dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+            out_cpu = out.detach().to(config.torch_dtype).cpu()
+            if config.overlap_communication:
+                _isend_with_lookback(out_cpu, next_rank, tag, "fwd")
+            else:
+                dist.send(out_cpu, dst=next_rank, tag=tag)
             return out, hidden_in
 
     def eval_pass(eval_tag_prefix: str) -> float | None:
@@ -631,7 +675,11 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
                 out.backward(grad.to(device))
 
             if not is_first:
-                dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
+                grad_cpu = hidden_in.grad.detach().to(config.torch_dtype).cpu()
+                if config.overlap_communication:
+                    _isend_with_lookback(grad_cpu, prev_rank, tag, "grad")
+                else:
+                    dist.send(grad_cpu, dst=prev_rank, tag=tag)
 
             if is_accum_end:
                 optimizer.step()
@@ -670,6 +718,12 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     if is_last and losses:
         print(f"[rank {rank}] loss avg first epoch: {sum(losses[:n_steps]) / n_steps:.4f}", flush=True)
         print(f"[rank {rank}] loss avg last epoch:  {sum(losses[-n_steps:]) / n_steps:.4f}", flush=True)
+
+    # Any isend from overlap_communication's last iteration is still
+    # potentially in flight - must be confirmed handed off before
+    # tearing the connection down, or a real send could be silently
+    # dropped mid-transfer.
+    _drain_pending_sends()
 
     dist.barrier()
     pg = dist.distributed_c10d._get_default_group()
