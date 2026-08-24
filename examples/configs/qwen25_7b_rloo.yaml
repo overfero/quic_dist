@@ -1,0 +1,37 @@
+# RLOO on Qwen2.5-7B, real 2-machine cross-machine (world_size=2, one
+# rank per machine - same topology as qwen25_7b_ppo.yaml's already-
+# confirmed real cross-machine run, and qwen25_0.5b_rloo.yaml's real
+# cross-machine RLOO proof, just combined: a real ~14x larger model).
+# group_size=2 (not 4, like the 0.5B config) and max_new_tokens=8 (not
+# 16) - real pipeline_generate cost scales with both, and a 7B model's
+# per-token round trip is already meaningfully slower than 0.5B's.
+#
+# Run: python3 rloo_pipeline_rank.py configs/qwen25_7b_rloo.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-7B
+world_size: 2
+num_layers: 28
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: bfloat16
+cpu_offload_unused_layers: true
+connect_timeout_s: 1800
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 8
+prompt_field: instruction
+max_prompt_len: 24
+
+group_size: 2
+max_new_tokens: 8
+temperature: 1.0
+kl_coef: 0.05
+baseline: rloo
+epochs: 3
+lr: 0.0001
+log_every: 1
