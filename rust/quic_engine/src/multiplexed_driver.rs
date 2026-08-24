@@ -443,18 +443,66 @@ fn run_driver_loop(
         }
         let _ = state.socket.set_read_timeout(Some(recv_timeout));
 
+        // Block for the first datagram (or the timeout), then drain
+        // every OTHER datagram already sitting in the kernel's receive
+        // queue right now before moving on to the rest of this tick -
+        // NOT just one per full loop iteration, which this used to do.
+        // Real bug found via a direct repro (a large parallel-stream
+        // send stalling mid-transfer on LOOPBACK with real self-induced
+        // packet loss, `QUIC_DIST_RUST_DEBUG=1` showing quinn-proto's
+        // own cwnd plateau well under any configured cap): a GSO-batched
+        // sender can burst many datagrams onto the wire in a single
+        // syscall, especially on loopback where there's no real RTT to
+        // spread them out naturally, and this loop's one-datagram-per-
+        // full-iteration cadence (timers, event draining, send-side
+        // work, debug logging all happen between one `recv_from` and the
+        // next) is far slower than datagrams can arrive in a burst - the
+        // kernel's real receive buffer (~208KB, `net.core.rmem_max`-
+        // capped on this project's machines - see
+        // `project_os_udp_buffer_ceiling` in memory) fills and drops
+        // packets even though quinn-proto's own logical congestion
+        // window never got anywhere near its configured cap. `write_stream`
+        // returning "done" does not mean the peer received anything (see
+        // the `PendingSend`/`done_tx` reasoning elsewhere in this file) -
+        // this is the same class of gap on the RECEIVE side. Uses
+        // `set_nonblocking`, not a second `set_read_timeout` (which
+        // errors on a zero `Duration`), for the drain pass only -
+        // restored to the real blocking timeout at the top of the next
+        // iteration.
+        let mut fatal_recv_error: Option<std::io::Error> = None;
         match state.socket.recv_from(&mut recv_buf) {
             Ok((n, from)) => {
                 let data = BytesMut::from(&recv_buf[..n]);
                 if let Ok(responses) = state.engine.receive_datagram(Instant::now(), from, None, data) {
                     state.send_all(responses);
                 }
+                if state.socket.set_nonblocking(true).is_ok() {
+                    loop {
+                        match state.socket.recv_from(&mut recv_buf) {
+                            Ok((n, from)) => {
+                                let data = BytesMut::from(&recv_buf[..n]);
+                                if let Ok(responses) = state.engine.receive_datagram(Instant::now(), from, None, data) {
+                                    state.send_all(responses);
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => {
+                                fatal_recv_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    let _ = state.socket.set_nonblocking(false);
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(error) => {
-                finish_all(&inbound_tx, &mut handshake_tx, format!("socket recv error: {error}"));
-                break;
+                fatal_recv_error = Some(error);
             }
+        }
+        if let Some(error) = fatal_recv_error {
+            finish_all(&inbound_tx, &mut handshake_tx, format!("socket recv error: {error}"));
+            break;
         }
 
         let now = Instant::now();
@@ -546,7 +594,30 @@ fn run_driver_loop(
             state.drive_channel_send(&name, Instant::now());
         }
 
-        if let Ok(queued) = outbound_rx.try_recv() {
+        // Drain EVERY queued send waiting right now, not just one - see
+        // module docstring / `project_gpipe_overlap_tag_bug`-adjacent
+        // parallel-stream stall investigation. This used to be `if let`
+        // (at most one new channel started per loop tick). Real bug found
+        // by reading this loop against the parallel-stream repro
+        // (`process_group.py`'s `_send_one`/`_recv_one` spawn
+        // `_NUM_PARALLEL_STREAMS` Python threads that all call
+        // `send_on_channel` near-simultaneously, each pushing one
+        // `QueuedSend` onto this SAME shared `outbound_rx`): with only one
+        // drained per tick, a batch's second/third stream could sit queued
+        // while the first stream's `drive_channel_send` + the final
+        // `state.transmit(now)` below ran with quinn-proto having nothing
+        // else new to package - `Connection::poll_transmit` sets its own
+        // `app_limited` flag exactly when it finds no queued data and no
+        // congestion block, and `Cubic::on_ack` skips ALL window growth
+        // when `app_limited` was set, matching this project's own
+        // `debug_stats()` observations (cwnd growing linearly by a small
+        // fixed increment instead of slow-start doubling, with zero real
+        // loss). Draining every ready channel before the tick's `transmit`
+        // call means every stream that has bytes to offer gets a chance to
+        // fill quinn-proto's send buffer on the SAME tick its sibling
+        // does, instead of spuriously starving the congestion controller's
+        // view of real demand.
+        while let Ok(queued) = outbound_rx.try_recv() {
             let out_ch = state.out_channels.entry(queued.channel.clone()).or_default();
             if out_ch.pending.is_none() {
                 let mut framed = Vec::with_capacity(LEN_PREFIX_BYTES + queued.payload.len() + 16);
@@ -569,6 +640,38 @@ fn run_driver_loop(
                     queued.channel
                 )));
             }
+        }
+
+        // Retry EVERY channel with an unfinished pending send that isn't
+        // genuinely blocked, every tick - not just the ones that got a
+        // fresh `Writable` edge or a brand-new enqueue above. Real
+        // regression found via a direct repro (a large parallel-stream
+        // send stalling forever mid-transfer with ZERO loss, full peer
+        // ACK coverage, and cwnd sitting well under its cap -
+        // `QUIC_DIST_RUST_DEBUG=1` showed the sender simply never wrote
+        // any more bytes after an initial partial write): `write_stream`
+        // returning `Ok(n)` with `n < requested` (a PARTIAL accept, not a
+        // full `Ok(0)` block) does NOT set `blocked_on_writable` -
+        // `drive_channel_send`'s own comment calls this "retry next loop
+        // tick", which only actually happens if something unconditionally
+        // retries every tick. `driver.rs`'s single-channel
+        // `run_driver_loop` does exactly that (`state.drive_pending_send`
+        // called every iteration, unconditionally - see its own inline
+        // comments for the identical reasoning) but this multi-channel
+        // port never got the same unconditional retry when it was split
+        // per-channel: a channel could only be re-driven by a genuine
+        // `StreamEvent::Writable` edge or a fresh enqueue, and a channel
+        // that exited via the partial-write path (no edge pending, no new
+        // data queued) was never touched again - a silent regression from
+        // the single-channel design this was ported from.
+        let retry_names: Vec<String> = state
+            .out_channels
+            .iter()
+            .filter(|(_, out_ch)| out_ch.pending.is_some() && !out_ch.blocked_on_writable)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in retry_names {
+            state.drive_channel_send(&name, Instant::now());
         }
 
         state.transmit(Instant::now());

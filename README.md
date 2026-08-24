@@ -400,6 +400,61 @@ yet done.
   real, validated example. Only wired into `finetune.py`'s SFT/CPT path
   so far, not into `rlhf.py`'s DPO/GRPO/PPO/RLOO/RM/PRM.
 
+- [x] **Parallel-stream send/recv stall - resolved** (`ProcessGroupQUIC.
+  _use_parallel_streams`/`_chunk_plan` in `process_group.py`) - large
+  tensors fan out over several concurrent QUIC streams instead of one.
+  Previously shipped OFF by default (threshold effectively unreachable)
+  after a real, then-unresolved stall on repeated large sends over one
+  connection. This session found and fixed THREE independent, real root
+  causes (none of them the "Cubic app_limited" theory the code's own
+  prior comment spent most of its words on - that theory was plausible
+  from the stats alone but wasn't the actual mechanism):
+
+  1. Linux doubles whatever `SO_RCVBUF`/`SO_SNDBUF` value it grants
+     before returning it from `getsockopt()` (kernel bookkeeping, not
+     real payload capacity) - `window` in `process_group.py` used the
+     raw (doubled) value, confirmed directly (`getsockopt` returned
+     exactly 2x `net.core.rmem_max` on this project's own machines).
+  2. `max_congestion_window` was ALSO set to `8 * window` (the same
+     ratio as the flow-control windows) instead of `1 * window` - the
+     very ratio this project's own upstream
+     (`vllm/transport/quic_transport.py`) documents as correct ("capped
+     at 1x - not 8x") but whose own code, three lines below that
+     comment, still passes 8x - a real, pre-existing comment/code drift
+     inherited here unnoticed, caught by this session's direct repro.
+     Combined with #1, the effective cap was ~16x the real kernel
+     buffer, so `congestion.rs`'s `BoundedController` (built to prevent
+     exactly this) never actually engaged before self-induced loss did.
+  3. A genuine driver-loop bug in `multiplexed_driver.rs::
+     drive_channel_send`: a PARTIAL write (`write_stream` returning
+     `Ok(n)` with `n` < requested - a real limit hit, not a full block)
+     never set `blocked_on_writable`, so nothing ever re-drove that
+     channel unless a fresh `Writable` edge happened to fire on its own.
+     `driver.rs`'s older single-channel loop avoids this by retrying
+     unconditionally every tick; the multi-channel port never got the
+     same treatment - a channel could stall forever with data still
+     queued, zero loss, full peer ACK coverage, and free congestion-
+     window room, simply because nothing ever asked it to keep writing.
+
+  Fixing this also surfaced a real regression in `_get_or_connect`'s
+  auto-reconnect race (`ProcessGroupQUIC._retry_dead_conn`, new this
+  session): `is_dead()` is only checked BEFORE handing a connection to
+  the caller, so a connection dying WHILE a blocked `recv()` call is
+  in flight still raised the stale connection's own error instead of
+  transparently reconnecting - always possible, just rare enough that
+  the original (slower) driver loop's timing had apparently never hit
+  it in this test suite before. Fixed with a bounded one-retry wrapper.
+
+  **Validated results**: loopback (3 repeated runs of a back-to-back
+  large-message repro, plus an 8-message mixed-size stress run up to
+  32MB/message, byte-exact every time); the full pytest suite (19/19)
+  on two independent machines sharing the identical 208KB
+  `net.core.rmem_max`/`wmem_max` ceiling; and a REAL cross-machine run
+  over an actual network path (~1ms measured RTT, not loopback) for
+  both the basic and stress repros, byte-exact, no stall. Still off by
+  default pending a decision on the new default threshold - opt in via
+  `QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES`.
+
 ## Known limitations
 
 See the full deliverable report for the complete architecture, design

@@ -340,7 +340,10 @@ impl Engine {
         let (_, connection) = self.connection.as_ref()?;
         let stats = connection.stats();
         Some(format!(
-            "cwnd={} rtt={:?} congestion_events={} lost_packets={} lost_bytes={} sent_packets={} udp_tx_datagrams={} udp_tx_bytes={}",
+            "cwnd={} rtt={:?} congestion_events={} lost_packets={} lost_bytes={} sent_packets={} \
+             udp_tx_datagrams={} udp_tx_bytes={} udp_rx_datagrams={} udp_rx_bytes={} \
+             frame_tx_stream={} frame_tx_acks={} frame_rx_acks={} frame_rx_stream_data_blocked={} \
+             frame_rx_data_blocked={} black_holes={}",
             stats.path.cwnd,
             stats.path.rtt,
             stats.path.congestion_events,
@@ -349,6 +352,14 @@ impl Engine {
             stats.path.sent_packets,
             stats.udp_tx.datagrams,
             stats.udp_tx.bytes,
+            stats.udp_rx.datagrams,
+            stats.udp_rx.bytes,
+            stats.frame_tx.stream,
+            stats.frame_tx.acks,
+            stats.frame_rx.acks,
+            stats.frame_rx.stream_data_blocked,
+            stats.frame_rx.data_blocked,
+            stats.path.black_holes_detected,
         ))
     }
 

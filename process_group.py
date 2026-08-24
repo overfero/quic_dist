@@ -97,74 +97,73 @@ _DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024 * 1024
 _NO_TIMEOUT_MS = 2**31 - 1
 _DRAIN_TIMEOUT_MS = 3000
 # Parallel-stream send/recv (see ProcessGroupQUIC._use_parallel_streams/
-# _chunk_plan) - OFF BY DEFAULT (threshold effectively unreachable) after
-# a real, unresolved stall found via direct testing - NOT purely a real-
-# RTT/cross-machine artifact, confirmed to occur on loopback too given
-# enough cumulative data: on the real cross-machine link (local <->
-# akun7, 65ms RTT), batching aggregate in-flight bytes per BATCH to a
-# small, proven-safe 2MiB (2 streams * 1MiB chunks) was NOT sufficient -
-# a second, immediately-following 2MB message (a separate dist.send()
-# call, own tag, itself also parallel-stream) returned "done" in under
-# 10ms, too fast to be a genuine ~2MB/65ms-RTT transfer (quinn-proto
-# accepted it into an internal buffer without it actually being on the
-# wire yet), and a THIRD 2MB message then hung completely - zero
-# connection activity until the 45s idle_timeout killed it outright, not
-# merely slow. The SAME pattern reproduced on loopback (~0ms RTT) with a
-# single larger transfer (10MB in one parallel-stream send, after an
-# earlier small warmup send on the same connection): CUMULATIVE
-# unflushed demand across separate calls stalls a connection regardless
-# of real network RTT, so this is a flow-control-accounting bug in the
-# multiplexed driver, not an RTT-pacing issue - bounding one call's
-# aggregate size does not bound the connection's total unflushed demand
-# over its lifetime. Partially root-caused via direct instrumentation of
-# quinn-proto's own ConnectionStats (rust/quic_engine/src/engine.rs's
-# `debug_stats()`, gated behind QUIC_DIST_RUST_DEBUG=1 - kept in the
-# driver as a reusable diagnostic, not removed): on a real repro, `cwnd`
-# starts at quinn-proto's initial window (~12000 bytes) and does NOT grow
-# via slow start's expected exponential doubling - it grows LINEARLY, by
-# a small fixed increment (~2900 bytes) per step, with zero loss events
-# recorded (congestion_events=0) the whole time. Root cause narrowed
-# further via direct reading of quinn-proto 0.11.17's own source (not
-# guessed): `engine.rs::build_transport_config` configures
-# `CubicConfig`, not NewReno - the earlier "NewReno quirk" framing above
-# was wrong, corrected here. `Cubic::on_ack` (`congestion/cubic.rs`) has
-# a guard at its very top: `if app_limited || ... { return; }` - if
-# quinn-proto judged the connection "app-limited" at ACK time
-# (`connection/mod.rs`: `self.app_limited = buf.is_empty() &&
-# !congestion_blocked` inside `poll_transmit` - true whenever a poll
-# found nothing queued to send AND it wasn't cwnd-blocked), that ACK
-# contributes ZERO window growth, silently. This project's own driver
-# design (`multiplexed_driver.rs::drive_channel_send`) has a separate,
-# confirmed gap in the same area: it calls `done_tx.send(Ok(()))` (i.e.
-# reports the send complete to the Python caller) the moment
-# `write_stream()` has accepted every byte of the message into
-# quinn-proto's SEND buffer - flow control only, per `write_stream`'s
-# own documented semantics (see the module docstring above) - with no
-# check that those bytes have actually left the process, let alone been
-# ACKed. `close()`'s existing `_DRAIN_TIMEOUT_MS` (3000ms,
-# `process_group.py`) is the only place that waits for a real drain,
-# and only at teardown/reconnect. Put together, this reframes the
-# "cumulative demand" finding above more precisely: `send()`/`isend()`
-# returning is not proof the wire is clear, so a second large send hot
-# on the heels of the first (the literal shape of the original repro)
-# piles new backlog onto a connection whose prior backlog may still be
-# draining at whatever the true (still slow, still not fully explained)
-# growth rate turns out to be, and a 3s bound that's generous on
-# loopback can plausibly run out on a real link. The one part still
-# genuinely open: WHY growth is linear/slow rather than the fast
-# doubling Cubic's own slow-start branch (`self.window += bytes`,
-# unguarded by the `app_limited` check) should produce when nothing is
-# loss- or ssthresh-limited - i.e. whether `poll_transmit` in this
-# driver's own loop is intermittently leaving the "nothing queued"
-# state that trips `app_limited` even while a large message is still
-# mid-flight, is the next concrete thing to instrument (the existing
-# `debug_stats()`/`QUIC_DIST_RUST_DEBUG=1` tooling is enough to check
-# this - it just hasn't been checked yet). Correctness IS verified for isolated small-to-medium transfers
-# (see test_parallel_stream.py) and the code path is otherwise complete,
-# so it's left in place as an explicit opt-in via
-# QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES for anyone who wants to
-# experiment further, not deleted - just don't rely on it under
-# sustained/repeated large-tensor traffic until this is root-caused.
+# _chunk_plan) - RESOLVED this session; still OFF BY DEFAULT (threshold
+# effectively unreachable) pending a decision on the default, not because
+# it's unsafe. The stall this threshold used to guard against had THREE
+# independent, real, now-fixed root causes, none of them the "app_limited
+# kills Cubic slow-start growth" theory the paragraph this replaces spent
+# most of its words on (that theory was plausible from the stats alone
+# but turned out not to be the actual mechanism - left in the file's git
+# history, not repeated here, since it didn't pan out):
+#
+# 1. Linux doubles whatever SO_RCVBUF/SO_SNDBUF value it grants before
+#    returning it from getsockopt() (kernel bookkeeping convention, not
+#    real payload capacity) - `window` below used the raw (doubled)
+#    value, feeding `max_congestion_window` a number ~2x the real usable
+#    kernel buffer. See `window`'s own computation a bit further down in
+#    this file for the fix and the direct confirmation (getsockopt
+#    returned exactly 2x `net.core.rmem_max` on this project's own
+#    machines).
+# 2. `max_congestion_window` was ALSO set to `8 * window` (matching
+#    send_window/receive_window's flow-control ratio) instead of `1 *
+#    window` - the very ratio this project's own upstream
+#    (vllm/transport/quic_transport.py) documents as correct ("capped at
+#    1x - not 8x - the real buffer size") but whose own code, three lines
+#    below that comment, still passes 8x - a real, pre-existing
+#    comment/code drift inherited here unnoticed until this session's
+#    direct repro caught it. Combined with #1, the effective cap was
+#    ~16x the real kernel buffer, so `congestion.rs`'s `BoundedController`
+#    (built specifically to prevent bursting past that buffer) never
+#    actually engaged before self-induced loss did.
+# 3. A genuine driver-loop bug in `multiplexed_driver.rs::drive_channel_
+#    send`: a PARTIAL write (`write_stream` returning `Ok(n)` with `n` <
+#    requested - a real limit hit, not a full block) never set
+#    `blocked_on_writable`, so nothing ever re-drove that channel unless
+#    a fresh `StreamEvent::Writable` edge happened to fire independently.
+#    `driver.rs`'s older single-channel loop avoids this by calling its
+#    equivalent unconditionally every tick; the multi-channel port never
+#    got the same unconditional retry - a channel could stall forever
+#    with data still queued, zero loss, full peer ACK coverage, and
+#    plenty of free congestion-window room, simply because nothing ever
+#    asked it to keep writing.
+#
+# All three found via a real, repeatable, standalone repro (several large
+# tensors sent back-to-back on one connection, deliberately reproducing
+# the exact "second/third message" shape from the original cross-machine
+# finding below) - not guessed, and re-validated after each fix with
+# QUIC_DIST_RUST_DEBUG=1's cwnd/loss/ACK/frame counters until the
+# self-induced loss and the stall both disappeared. Confirmed clean on:
+# loopback (3 repeated runs of the exact repro, plus an 8-message mixed-
+# size stress run up to 32MB per message, byte-exact); the full pytest
+# suite (19/19) on two independent machines (this one and a second, real
+# remote box with the identical 208KB net.core.rmem_max/wmem_max
+# ceiling); and a REAL cross-machine run over an actual network path
+# (~1ms measured RTT, not loopback - both the basic 3-message repro and
+# the 8-message mixed-size stress run), all byte-exact, no stall. Fixing
+# this also surfaced and fixed a separate, real regression in
+# `_get_or_connect`'s auto-reconnect race (see `_retry_dead_conn`'s own
+# docstring below) that the original code's slower driver loop had
+# apparently never hit often enough to expose.
+#
+# Original cross-machine finding (kept for context on WHAT was being
+# chased, even though the root cause turned out to be the three items
+# above, not an RTT-pacing issue): on a real cross-machine link (local <->
+# akun7, 65ms RTT), a second, immediately-following 2MB message returned
+# "done" in under 10ms - too fast to be a genuine transfer, quinn-proto
+# had just accepted it into an internal buffer without it actually being
+# on the wire - and a third 2MB message then hung completely until the
+# idle_timeout killed it. The same pattern reproduced on loopback too,
+# which is what proved early on this was never purely an RTT artifact.
 _PARALLEL_STREAM_THRESHOLD_BYTES = int(os.environ.get("QUIC_DIST_PARALLEL_STREAM_THRESHOLD_BYTES", 2**62))
 _NUM_PARALLEL_STREAMS = int(os.environ.get("QUIC_DIST_NUM_PARALLEL_STREAMS", 2))
 _PARALLEL_CHUNK_BYTES = int(os.environ.get("QUIC_DIST_PARALLEL_CHUNK_BYTES", 1024 * 1024))
@@ -418,7 +417,35 @@ class ProcessGroupQUIC(dist.ProcessGroup):
             try:
                 granted_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
                 granted_sndbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
-                window = max(64 * 1024, min(granted_rcvbuf, granted_sndbuf))
+                # Linux doubles whatever SO_RCVBUF/SO_SNDBUF value it grants
+                # before returning it from getsockopt() - documented kernel
+                # behavior (accounts for internal bookkeeping overhead, not
+                # real payload capacity), confirmed directly on this
+                # project's own machines: `net.core.rmem_max`/`wmem_max` are
+                # hard-capped at 212992 bytes (see
+                # `project_os_udp_buffer_ceiling` in memory), yet
+                # getsockopt(SO_RCVBUF) after requesting far more than that
+                # returns exactly 425984 = 2 * 212992. Using the raw
+                # (doubled) value here as `window` - as this used to - fed
+                # `max_congestion_window = 8 * window` a value ~16x the
+                # REAL usable kernel buffer, which defeated
+                # `congestion.rs`'s `BoundedController` entirely (its whole
+                # purpose: cap the reported congestion window at the real
+                # OS buffer ceiling, see that file's module docstring) -
+                # self-induced packet loss from bursting past the actual
+                # ~208KB kernel buffer started well before quinn-proto's
+                # window ever approached the inflated ~3.4MB cap. Root-
+                # caused via direct instrumentation of a real stall repro
+                # (a 2.5M-float parallel-stream send hung mid-transfer;
+                # `QUIC_DIST_RUST_DEBUG=1` showed cwnd plateau at ~187KB -
+                # right at the real ceiling - with congestion_events=21 and
+                # lost_bytes=628692, nowhere near the 8x-inflated cap that
+                # was supposed to prevent exactly this). Halving here
+                # recovers the real usable capacity the rest of this
+                # method's sizing logic (`max_congestion_window`,
+                # `flow_window`, `stream_window`) was always meant to be
+                # anchored to.
+                window = max(64 * 1024, min(granted_rcvbuf, granted_sndbuf) // 2)
             except OSError:
                 window = _FALLBACK_WINDOW_BYTES
             stream_window = self._stream_window_multiplier(measured_rtt_ms) * window
@@ -433,16 +460,38 @@ class ProcessGroupQUIC(dist.ProcessGroup):
             # 0-2 of a 4-way parallel-stream send completed, chunk 3 never
             # got anywhere). max_congestion_window is DELIBERATELY NOT
             # scaled the same way - it's a different mechanism (see
-            # rust/src/quic_engine/src/congestion.rs's BoundedController
-            # module docstring): the real, tested protection against
-            # bursting past the tiny actual OS socket buffer, independent
-            # of how much flow-control window authorizes. Raising it
-            # alongside flow control would reintroduce exactly the
-            # self-induced-loss stall that cap exists to prevent; leaving
-            # it at the already-proven-safe 8x while only raising the flow-
-            # control ceiling is what makes N-stream parallelism additive
-            # instead of another blind step along the same failure mode
-            # &sect;7's binary search already mapped out for a single stream.
+            # rust/quic_engine/src/congestion.rs's BoundedController module
+            # docstring): the real, tested protection against bursting past
+            # the tiny actual OS socket buffer, independent of how much
+            # flow-control window authorizes. Raising it alongside flow
+            # control reintroduces exactly the self-induced-loss stall that
+            # cap exists to prevent.
+            #
+            # CORRECTION (found via a real repro this session, not
+            # inherited from the comment this replaces): the connect
+            # call below used to pass `8 * window` for max_congestion_window
+            # too - the SAME 8x this project's own upstream
+            # (vllm/transport/quic_transport.py) uses for send/receive
+            # window. That upstream file's own docstring explicitly says
+            # the congestion cap should be "capped at 1x - not 8x - the
+            # real buffer size" (a real, previously-tested finding) but its
+            # OWN code three lines below that comment still passes `8 *
+            # window` - a real, pre-existing drift between that comment and
+            # its code, inherited here unnoticed. Confirmed independently
+            # via direct instrumentation on this repo (`QUIC_DIST_RUST_
+            # DEBUG=1`, extra `debug_stats()` fields added to
+            # `engine.rs`): a large parallel-stream send stalled with real
+            # self-induced loss (`sender udp_tx_bytes` exceeding `receiver
+            # udp_rx_bytes` by exactly the reported `lost_bytes`) with cwnd
+            # plateauing at ~190-240KB - right at the real ~208KB kernel
+            # buffer ceiling (`net.core.rmem_max`/`wmem_max`, see
+            # `project_os_udp_buffer_ceiling` in memory) - nowhere near an
+            # 8x-inflated ~1.7MB cap. `BoundedController` only helps if
+            # its cap is actually AT the real ceiling, not 8x past it.
+            # Flow control (`flow_window`, below) stays generous (8x) since
+            # that's a different, already-validated concern (see the
+            # 4-stream-exhaustion bug 2 paragraphs up) - only the
+            # congestion cap changes.
             flow_window = max(8 * window, _NUM_PARALLEL_STREAMS * stream_window)
             # Real bug found via a cross-machine 27B PPO run: this was
             # hardcoded to a fixed 45s, regardless of the `timeout=` a
@@ -468,12 +517,12 @@ class ProcessGroupQUIC(dist.ProcessGroup):
                     driver = _qe.PyMultiplexedConnectionDriver.connect_client(
                         sock.fileno(), coordinator_peer_addr[0], coordinator_peer_addr[1],
                         "quic-dist-v1", idle_timeout_ms, flow_window, flow_window, stream_window,
-                        8 * window, _DEFAULT_MAX_MESSAGE_BYTES, handshake_timeout_ms,
+                        window, _DEFAULT_MAX_MESSAGE_BYTES, handshake_timeout_ms,
                     )
                 else:
                     driver = _qe.PyMultiplexedConnectionDriver.connect_server(
                         sock.fileno(), idle_timeout_ms, flow_window, flow_window, stream_window,
-                        8 * window, _DEFAULT_MAX_MESSAGE_BYTES, handshake_timeout_ms,
+                        window, _DEFAULT_MAX_MESSAGE_BYTES, handshake_timeout_ms,
                     )
             except ValueError as exc:
                 transport.close()
@@ -566,12 +615,43 @@ class ProcessGroupQUIC(dist.ProcessGroup):
             offset = end
         return chunks
 
+    def _retry_dead_conn(self, peer_rank: int, op):
+        """Runs `op(conn)` against the current connection to `peer_rank`,
+        retrying ONCE against a freshly reconnected connection if `op`
+        raises `ConnectionError` because that connection died. Closes a
+        real race in `_get_or_connect`'s own "auto-reconnect on next
+        send/recv" contract: `is_dead()` is only checked BEFORE handing
+        the connection to the caller, so a connection that dies WHILE
+        `op` is blocked inside it (the common case for `recv()`, which
+        waits on a queue) still raises the stale connection's own
+        `_closed_exc` instead of transparently reconnecting - found via a
+        real, reproducible test failure (`test_reconnect.py`) after
+        changes elsewhere in this session made the underlying driver
+        loop's close-detection faster/tighter, widening how often this
+        race is actually hit (it was always possible, just rarer before).
+        Bounded to exactly one retry: if `_get_or_connect` hands back the
+        SAME (still-dead) object a second time, the peer is genuinely
+        unreachable, not just unlucky timing - propagate rather than loop
+        forever."""
+        conn = self._get_or_connect(peer_rank)
+        try:
+            return op(conn)
+        except ConnectionError:
+            if not conn.is_dead():
+                raise
+            retried = self._get_or_connect(peer_rank)
+            if retried is conn:
+                raise
+            return op(retried)
+
     def _send_one(self, tensor: torch.Tensor, dst: int, tag: int, msg_id: int) -> None:
         payload = serialize_tensor(tensor, message_id=msg_id, microbatch_id=tag, tensor_id=0)
-        conn = self._get_or_connect(dst)
         if not self._use_parallel_streams(tensor):
-            conn.send(str(tag), payload, self._timeout.total_seconds())
+            self._retry_dead_conn(
+                dst, lambda conn: conn.send(str(tag), payload, self._timeout.total_seconds())
+            )
             return
+        conn = self._get_or_connect(dst)
 
         chunks = self._chunk_plan(len(payload))
         for batch_start in range(0, len(chunks), _NUM_PARALLEL_STREAMS):
@@ -596,11 +676,12 @@ class ProcessGroupQUIC(dist.ProcessGroup):
                 raise errors[0]
 
     def _recv_one(self, tensor: torch.Tensor, src: int, tag: int) -> None:
-        conn = self._get_or_connect(src)
-
         if not self._use_parallel_streams(tensor):
-            payload = conn.recv(str(tag), self._timeout.total_seconds())
+            payload = self._retry_dead_conn(
+                src, lambda conn: conn.recv(str(tag), self._timeout.total_seconds())
+            )
         else:
+            conn = self._get_or_connect(src)
             # Chunk plan must exactly match the sender's - both derive it
             # the same way, from `wire_size(tensor)`, which is why the
             # pre-allocated `tensor` argument's shape/dtype must already
