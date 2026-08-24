@@ -49,7 +49,7 @@ import torch.nn.functional as F
 import quic_dist
 import torch.distributed as dist
 
-from quic_dist.finetune import resolve_attr, stage_range, build_device_map, build_stage_model
+from quic_dist.finetune import resolve_attr, stage_range, build_device_map, build_stage_model, run_decoder_layer
 
 
 @dataclass
@@ -324,7 +324,7 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
             pos_emb = rotary(hidden, position_ids) if rotary is not None else None
             out = hidden
             for layer in stage_layers:
-                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
 
             if is_last:
                 out = norm(out)
@@ -559,7 +559,7 @@ def run_rm_training(rank: int, signaling_url: str, config: RMConfig, job_id: str
             pos_emb = rotary(hidden, position_ids) if rotary is not None else None
             out = hidden
             for layer in stage_layers:
-                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
 
             if is_last:
                 normed = norm(out)
@@ -790,7 +790,7 @@ def run_prm_training(rank: int, signaling_url: str, config: PRMConfig, job_id: s
             pos_emb = rotary(hidden, position_ids) if rotary is not None else None
             out = hidden
             for layer in stage_layers:
-                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
 
             if is_last:
                 normed = norm(out)
@@ -985,8 +985,21 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
     # inspect the model's real per-layer types up front and build the
     # right cache-layer class for every one of them (found via direct
     # testing on a real cross-machine GRPO run, not anticipated).
+    #
+    # NOT every installed transformers accepts `config=` here - it was
+    # added in a later release than this environment's own default (a
+    # real TypeError hit directly: transformers==4.53.3 has no `config`
+    # kwarg on DynamicCache.__init__ at all). Try the config-aware
+    # constructor first (needed for hybrid-attention models); fall back
+    # to the plain one on TypeError - correct for a uniform-attention
+    # model on either transformers version, and the best available on
+    # an old transformers even for a hybrid model (better than crashing
+    # outright on an import that predates the fix this comment describes).
     hf_config = AutoConfig.from_pretrained(config.model_path)
-    cache = DynamicCache(config=hf_config)
+    try:
+        cache = DynamicCache(config=hf_config)
+    except TypeError:
+        cache = DynamicCache()
     generated_chunks = []  # rank0 and is_last only; list of (G,) tensors, one per new token
     cur_token = None       # rank0 only: the (G,1) token to embed this call
 
@@ -1012,9 +1025,26 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
             pos_emb = rotary(hidden, position_ids) if rotary is not None else None
             out = hidden
             for layer in stage_layers:
-                out = layer(out, attention_mask=None, position_ids=position_ids,
-                            past_key_values=cache, use_cache=True, cache_position=cache_position,
-                            position_embeddings=pos_emb)
+                # The cache kwarg's NAME has genuinely changed between
+                # transformers versions (confirmed directly: this
+                # environment's Qwen2DecoderLayer.forward takes
+                # `past_key_value`, singular - an OLDER/newer version may
+                # take `past_key_values`, plural). Passing the wrong name
+                # does NOT raise - it's silently absorbed into the
+                # layer's **kwargs (Unpack[FlashAttentionKwargs]) and the
+                # cache is never actually threaded through, so decoding
+                # would silently lose all cross-step context instead of
+                # erroring - a real, dangerous-because-silent failure
+                # mode, not a hypothetical one. Try both real kwarg
+                # names rather than guessing one.
+                try:
+                    out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids,
+                                             past_key_value=cache, use_cache=True, cache_position=cache_position,
+                                             position_embeddings=pos_emb)
+                except TypeError:
+                    out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids,
+                                             past_key_values=cache, use_cache=True, cache_position=cache_position,
+                                             position_embeddings=pos_emb)
 
             if is_last:
                 last_hidden = out[:, -1:, :]
@@ -1075,7 +1105,7 @@ def pipeline_score(rank, config, stage_layers, embed, norm, rotary, hidden_size,
         pos_emb = rotary(hidden, position_ids) if rotary is not None else None
         out = hidden
         for layer in stage_layers:
-            out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+            out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
 
         if is_last:
             normed = norm(out)
@@ -1132,7 +1162,7 @@ def pipeline_score_prm(rank, config, stage_layers, embed, norm, rotary, hidden_s
         pos_emb = rotary(hidden, position_ids) if rotary is not None else None
         out = hidden
         for layer in stage_layers:
-            out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+            out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
 
         if is_last:
             normed = norm(out)
@@ -1310,7 +1340,7 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
                     pos_emb = rotary(hidden, position_ids) if rotary is not None else None
                     out = hidden
                     for layer in stage_layers:
-                        out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                        out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
                     if is_last:
                         out = norm(out)
                         logits = lm_head(out.to(lm_head.weight.dtype))
@@ -1368,6 +1398,256 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
 
     total_elapsed = time.monotonic() - t_start
     print(f"[rank {rank}] GRPO training DONE in {total_elapsed:.1f}s ({total_steps} steps)", flush=True)
+    if is_last and rewards_log:
+        print(f"[rank {rank}] reward avg first {min(8,len(rewards_log))} steps: {sum(rewards_log[:8])/min(8,len(rewards_log)):.4f}", flush=True)
+        print(f"[rank {rank}] reward avg last {min(8,len(rewards_log))} steps:  {sum(rewards_log[-8:])/min(8,len(rewards_log)):.4f}", flush=True)
+
+    _teardown(rank)
+    return losses
+
+
+# ---------------------------------------------------------------------------
+# RLOO / REINFORCE
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RLOOConfig(RLHFModelConfig):
+    """Structurally near-identical to GRPOConfig - same rollout
+    (pipeline_generate), same free reference-model KL trick, same
+    single-pass (no PPO clip) policy-gradient update. The ONE real
+    difference is the advantage estimator, controlled by `baseline`:
+
+    - "rloo" (the actual RLOO estimator, Kool et al. / used in the RLOO-
+      for-RLHF line of work): advantage_i = r_i - mean(r_{-i}), i.e.
+      each sample's baseline is the mean of every OTHER sample in its
+      group, never itself. Unbiased (a real, provable property GRPO's
+      group-mean-AND-std normalization does not have - GRPO trades that
+      for variance reduction via the std division instead). Needs
+      group_size >= 2. This is the default because it is the estimator
+      actually named "RLOO" in the literature - "mean"/"none" below are
+      REINFORCE variants offered from the same code path since the user
+      asked for both.
+    - "mean": plain REINFORCE with a group-mean baseline (includes the
+      sample itself in the mean it's compared against - biased but the
+      common practical simplification, no std division unlike GRPO).
+    - "none": raw REINFORCE, advantage_i = r_i directly - the classic
+      algorithm, kept for completeness even though its variance is
+      usually too high to be practically useful past a handful of
+      training steps.
+
+    No std normalization in ANY of these three, unlike GRPOConfig's
+    (rewards - mean) / std - that division is a GRPO-specific choice,
+    not part of the original RLOO/REINFORCE formulations, so it is
+    deliberately NOT reproduced here."""
+
+    dataset_name: str = "tatsu-lab/alpaca"
+    dataset_split: str = "train"
+    num_examples: int | None = 32
+    prompt_field: str = "instruction"
+    max_prompt_len: int = 48
+
+    group_size: int = 4
+    max_new_tokens: int = 24
+    temperature: float = 1.0
+    kl_coef: float = 0.05
+    baseline: str = "rloo"   # "rloo" | "mean" | "none"
+    epochs: int = 1
+
+    @classmethod
+    def from_file(cls, path: str) -> "RLOOConfig":
+        return cls(**cls._load_raw(path))
+
+
+def build_rloo_prompts(tokenizer, config: RLOOConfig) -> list[torch.Tensor]:
+    from datasets import load_dataset
+
+    split = config.dataset_split if config.num_examples is None else f"{config.dataset_split}[:{config.num_examples}]"
+    ds = load_dataset(config.dataset_name, split=split)
+    prompts = []
+    for ex in ds:
+        ids = tokenizer(ex[config.prompt_field], truncation=True, max_length=config.max_prompt_len,
+                         add_special_tokens=True)["input_ids"]
+        prompts.append(torch.tensor([ids], dtype=torch.long))
+    return prompts
+
+
+def _rloo_advantage(rewards: torch.Tensor, baseline: str) -> torch.Tensor:
+    """rewards: (G,). No std normalization in any branch - see
+    RLOOConfig's docstring for why that's deliberate, not an oversight."""
+    G = rewards.shape[0]
+    if baseline == "rloo":
+        if G < 2:
+            raise ValueError(f"baseline='rloo' needs group_size >= 2 to leave one out, got {G}")
+        total = rewards.sum()
+        return rewards - (total - rewards) / (G - 1)
+    if baseline == "mean":
+        return rewards - rewards.mean()
+    if baseline == "none":
+        return rewards
+    raise ValueError(f"unknown baseline {baseline!r} - expected 'rloo', 'mean', or 'none'")
+
+
+def run_rloo_training(rank: int, signaling_url: str, config: RLOOConfig, job_id: str = "rloo_pipeline",
+                       reward_fn=default_reward_fn, rm: "LoadedRewardModel | None" = None) -> list[float]:
+    """`rm`, when given, scores each rollout with a real trained reward
+    model via pipeline_score() instead of reward_fn's rule-based text
+    heuristic - identical contract to run_grpo_training's `rm` param."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = _init_rank(
+        rank, signaling_url, config, job_id
+    )
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+    prev_rank = rank - 1 if rank > 0 else None
+    next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    # See run_dpo_training's identical barrier for why.
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
+
+    trainable = [p for p in peft_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+
+    prompts = build_rloo_prompts(tokenizer, config)
+    n_steps = len(prompts)
+    total_steps = n_steps * config.epochs
+    G = config.group_size
+    print(f"[rank {rank}] RLOO({config.baseline}): {config.epochs} epochs x {n_steps} prompts = {total_steps} steps, "
+          f"group_size={G}, max_new_tokens={config.max_new_tokens}", flush=True)
+
+    losses: list[float] = []
+    rewards_log: list[float] = []
+    t_start = time.monotonic()
+    step_counter = 0
+
+    for epoch in range(config.epochs):
+        for prompt_ids in prompts:
+            # See run_grpo_training's identical per-step barrier for why
+            # this is _step_barrier and NOT plain dist.barrier().
+            _step_barrier(signaling_url, config, f"rloo_{step_counter + 1}", job_id=job_id)
+            step_counter += 1
+            tag_gen = (step_counter % 4) * 3
+            tag_ref = tag_gen + 1
+            tag_policy = tag_gen + 2
+            tag_rm = 1000 + (step_counter % 8)
+
+            # --- 1. rollout: sample G completions from the CURRENT policy ---
+            peft_model.eval()
+            generated = pipeline_generate(
+                rank, config, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
+                is_first, is_last, prev_rank, next_rank, tag_gen,
+                group_size=G, max_new_tokens=config.max_new_tokens, temperature=config.temperature,
+                prompt_ids=prompt_ids if is_first else None,
+            )
+            peft_model.train()
+
+            prompt_len = prompt_ids.shape[1]
+            seq_len = prompt_len + config.max_new_tokens - 1
+
+            if is_first:
+                full_ids = torch.cat([prompt_ids.expand(G, -1), generated], dim=1).to(device)
+
+            # --- 2. reward + leave-one-out (or plain-mean/none) advantage.
+            # Same two reward sources as GRPO: a real trained reward
+            # model (`rm`) via a genuine pipeline-parallel round trip, or
+            # the default rule-based reward_fn (text-only, is_last alone). ---
+            if rm is not None:
+                rm_input = full_ids.cpu() if is_first else None
+                rm_reward = pipeline_score(
+                    rank, rm.config, rm.stage_layers, rm.embed, rm.norm, rm.rotary, rm.hidden_size, rm.reward_head,
+                    device, is_first, is_last, prev_rank, next_rank, tag_rm, input_ids=rm_input,
+                )
+                if is_last:
+                    rewards = rm_reward
+            elif is_last:
+                texts = [tokenizer.decode(generated[g], skip_special_tokens=True) for g in range(G)]
+                rewards = torch.tensor([reward_fn(t) for t in texts], dtype=torch.float32)
+
+            if is_last:
+                advantage = _rloo_advantage(rewards, config.baseline)
+                rewards_log.append(rewards.mean().item())
+
+            # --- 3. teacher-forced forward over prompt+generated: policy
+            # (grad) and reference (no grad, adapters disabled) - same
+            # free-reference trick as DPO/GRPO. ---
+            def forced_forward(tag, no_grad):
+                position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(G, -1)
+                ctx = torch.no_grad() if no_grad else torch.enable_grad()
+                with ctx:
+                    if is_first:
+                        hidden = embed(full_ids[:, :-1]).to(config.torch_dtype)
+                        hidden_in = None
+                    else:
+                        recv_buf = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
+                        dist.recv(recv_buf, src=prev_rank, tag=tag)
+                        hidden_in = recv_buf.to(device)
+                        if not no_grad:
+                            hidden_in = hidden_in.requires_grad_(True)
+                        hidden = hidden_in
+                    pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+                    out = hidden
+                    for layer in stage_layers:
+                        out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                    if is_last:
+                        out = norm(out)
+                        logits = lm_head(out.to(lm_head.weight.dtype))
+                        return logits, hidden_in
+                    dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+                    return out, hidden_in
+
+            optimizer.zero_grad()
+            with peft_model.disable_adapter():
+                ref_out, _ = forced_forward(tag_ref, no_grad=True)
+            policy_out, hidden_in = forced_forward(tag_policy, no_grad=False)
+
+            if is_last:
+                resp_start = prompt_len - 1
+                resp_logits_p = policy_out[:, resp_start:, :]
+                resp_logits_r = ref_out[:, resp_start:, :]
+                resp_labels = generated.to(device)
+                logp_policy = F.log_softmax(resp_logits_p.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
+                logp_ref = F.log_softmax(resp_logits_r.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
+                kl = (logp_policy - logp_ref)  # (G, N) - k1 estimator, per-token
+
+                # Plain REINFORCE/RLOO objective: -(advantage * logp).mean()
+                # plus the same KL-to-reference regularizer GRPO uses -
+                # ratio is exactly 1 here too (single update per rollout,
+                # no PPO clip - see run_ppo_training for the mode that
+                # actually needs the clip).
+                pg_loss = -(advantage.to(device).unsqueeze(1) * logp_policy).mean()
+                loss = pg_loss + config.kl_coef * kl.mean()
+                loss.backward()
+                losses.append(loss.item())
+            else:
+                grad = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
+                dist.recv(grad, src=next_rank, tag=tag_policy)
+                policy_out.backward(grad.to(device))
+
+            if not is_first:
+                dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
+
+            optimizer.step()
+            if step_counter <= 3 or step_counter % config.log_every == 0:
+                msg = f"[rank {rank}] step {step_counter}/{total_steps}"
+                if is_last:
+                    msg += f" rloo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl.mean().item():.4f}"
+                print(msg, flush=True)
+
+        elapsed = time.monotonic() - t_start
+        if is_last:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} loss={losses[-1]:.4f} "
+                  f"reward={rewards_log[-1]:.3f} elapsed={elapsed:.1f}s", flush=True)
+        else:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} elapsed={elapsed:.1f}s", flush=True)
+
+    total_elapsed = time.monotonic() - t_start
+    print(f"[rank {rank}] RLOO training DONE in {total_elapsed:.1f}s ({total_steps} steps)", flush=True)
     if is_last and rewards_log:
         print(f"[rank {rank}] reward avg first {min(8,len(rewards_log))} steps: {sum(rewards_log[:8])/min(8,len(rewards_log)):.4f}", flush=True)
         print(f"[rank {rank}] reward avg last {min(8,len(rewards_log))} steps:  {sum(rewards_log[-8:])/min(8,len(rewards_log)):.4f}", flush=True)
@@ -1554,7 +1834,7 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
                     pos_emb = rotary(hidden, position_ids) if rotary is not None else None
                     out = hidden
                     for layer in stage_layers:
-                        out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                        out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
                     if is_last:
                         normed = norm(out)
                         logits = lm_head(normed.to(lm_head.weight.dtype))

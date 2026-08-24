@@ -65,7 +65,7 @@ import torch.nn.functional as F
 import quic_dist
 import torch.distributed as dist
 
-from quic_dist.finetune import resolve_attr, stage_range, build_device_map
+from quic_dist.finetune import resolve_attr, stage_range, build_device_map, run_decoder_layer
 from quic_dist.rlhf import _step_barrier, _teardown
 
 
@@ -361,7 +361,7 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
 
     for epoch in range(config.epochs):
         for ex in examples:
-            _step_barrier(signaling_url, config, f"vlm_{step_counter}")
+            _step_barrier(signaling_url, config, f"vlm_{step_counter}", job_id=job_id)
             step_counter += 1
             tag = step_counter % 8
             input_ids = ex["input_ids"].unsqueeze(0)  # (1, T)
@@ -393,7 +393,7 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
             pos_emb = rotary(hidden, position_ids) if rotary is not None else None
             out = hidden
             for layer in stage_layers:
-                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
                 # Real, version-dependent difference found via a live run:
                 # this transformers version's Qwen2DecoderLayer.forward
                 # returns tuple[hidden_states, Optional[...]] (confirmed

@@ -1,0 +1,37 @@
+# RLOO on the same model/topology as qwen25_0.5b_grpo.yaml (Qwen2.5-0.5B,
+# 2-stage pipeline, one rank per real machine for a genuine cross-machine
+# run). Same rollout mechanism as GRPO (real pipeline-parallel
+# autoregressive decoding) and the same free-reference KL trick - the
+# one real difference is the advantage estimator: leave-one-out
+# (baseline: rloo) instead of GRPO's group mean/std normalization - see
+# RLOOConfig's docstring for why. Set baseline: mean or baseline: none
+# for plain REINFORCE variants instead.
+#
+# Run: python3 rloo_pipeline_rank.py configs/qwen25_0.5b_rloo.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 16
+prompt_field: instruction
+max_prompt_len: 32
+
+group_size: 4
+max_new_tokens: 16
+temperature: 1.0
+kl_coef: 0.05
+baseline: rloo
+epochs: 3
+lr: 0.0001
+log_every: 2
+connect_timeout_s: 1800

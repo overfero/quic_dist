@@ -153,7 +153,29 @@ def resolve_attr(obj, dotted_path: str):
     return obj
 
 
-def _step_barrier(signaling_url, config, tag: str, timeout_s: int = 300):
+def run_decoder_layer(layer, hidden_states, **kwargs):
+    """Calls one decoder layer and returns just the hidden-states
+    tensor, version-robustly. Some transformers releases' decoder layer
+    `forward` returns the hidden states directly; others (confirmed
+    directly, not assumed: transformers==4.53.3's
+    `Qwen2DecoderLayer.forward`) ALWAYS return a tuple
+    `(hidden_states,)` (plus attention weights if output_attentions=True)
+    regardless of use_cache/past_key_value - a real `AttributeError:
+    'tuple' object has no attribute 'dtype'` crash inside the NEXT
+    layer's input_layernorm is what surfaced this, in
+    pipeline_generate()'s decode loop, the first code path exercised
+    against a freshly-installed transformers after a full local
+    environment reset. Every place in this project that loops over raw
+    decoder-layer submodules (finetune.py's SFT loop, rlhf.py's DPO/
+    RM/PRM/GRPO/PPO/RLOO forced-forward and pipeline_generate,
+    multimodal.py's VLM loop) needs just the tensor - this is the one
+    place that difference is absorbed, so a future transformers version
+    changing this again only needs a fix here."""
+    out = layer(hidden_states, **kwargs)
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _step_barrier(signaling_url, config, tag: str, job_id: str = "", timeout_s: int = 300):
     """A REAL per-step barrier - unlike `dist.barrier()`, which is only
     safe to call ONCE per process group's lifetime. Found via a real
     cross-machine GRPO run (see quic_dist/rlhf.py's identical helper,
@@ -163,11 +185,20 @@ def _step_barrier(signaling_url, config, tag: str, timeout_s: int = 300):
     group reads the already-satisfied key from the FIRST call and
     returns immediately - a silent no-op. Reimplements the same
     add-then-wait-for-last-worker pattern directly against the store,
-    with a fresh key per `tag` so each call is genuinely independent."""
+    with a fresh key per `tag` so each call is genuinely independent.
+
+    `job_id` is included in the key on top of `tag` - see rlhf.py's
+    identical helper's docstring for the real hang this fixes (the
+    signaling server's `/kv/*` store is shared across every run that
+    ever points at it; two different runs reaching the same `tag`,
+    trivial across repeated dev-loop restarts, silently share a
+    counter, and an earlier crashed run's orphaned `add()` calls push
+    the count past `world_size` forever since the check is exact
+    equality, not `>=`)."""
     from quic_dist.store import QuicRendezvousStore
 
     store = QuicRendezvousStore(signaling_url, timeout=timedelta(seconds=timeout_s))
-    key = f"step_barrier_{tag}"
+    key = f"step_barrier_{job_id}_{tag}"
     count = store.add(key, 1)
     if count == config.world_size:
         store.set(f"{key}:done", "1")
@@ -385,7 +416,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
             # Uses _step_barrier, NOT dist.barrier() - see that
             # function's docstring for why a second dist.barrier() call
             # is a silent no-op.
-            _step_barrier(signaling_url, config, f"sft_{epoch}_{b}")
+            _step_barrier(signaling_url, config, f"sft_{epoch}_{b}", job_id=job_id)
             tag = step_counter % 8
             step_counter += 1
             block = batches[b]
@@ -409,7 +440,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
             pos_emb = rotary(hidden, position_ids) if rotary is not None else None
             out = hidden
             for layer in stage_layers:
-                out = layer(out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
 
             if is_last:
                 labels = block[:, 1:].to(device)
