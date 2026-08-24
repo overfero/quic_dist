@@ -31,6 +31,10 @@ finetune = [
     "datasets>=2.18",
     "pyyaml>=6.0",
     "pillow>=10.0",  # quic_dist.multimodal's real image preprocessing (RGB conversion, etc.)
+    "numpy>=1.24",   # quic_dist.training_utils' RNG state capture/restore (checkpoint resume) -
+                      # a real, direct `import numpy`, not a transitive assumption; found missing
+                      # from this list on a direct audit even though it happened to already be
+                      # installed in this environment via some other package's own dependency.
 ]
 
 # The package name (quic_dist) is declared here independent of whatever
