@@ -27,6 +27,13 @@ automatically via [rustup](https://rustup.rs) if you don't already have one)
 to build the QUIC engine. If you only need the signaling server, install
 with `pip install -e ".[signaling]"` for its `fastapi`/`uvicorn` deps.
 
+For `attn_implementation: flash_attention_2` on a Turing GPU (T4 etc.),
+see `flash_attn_turing_shim/README.md` - the official `flash-attn` PyPI
+package doesn't work in this kind of environment (see the training
+infrastructure checklist below for why), so this is a real, separate
+compatibility package, optional and only needed for that one config
+field.
+
 ## Usage
 
 ```python
@@ -241,19 +248,54 @@ yet done.
 - [ ] **Benchmark integration** - a standard external eval (e.g. a
   fixed perplexity benchmark corpus) beyond the in-repo held-out-slice
   eval above.
-- [ ] **Flash attention** - attempted, real failure, not just a
-  theoretical risk: `pip install flash-attn --no-build-isolation`
-  actually built a wheel successfully in this environment (~2-3 min,
-  faster than expected), but the compiled extension fails to import -
-  `undefined symbol: _ZN3c105Error...`, a C++ ABI mismatch between the
-  extension and the installed torch build (a well-known flash-attn pain
-  point - it needs a wheel built against the EXACT torch/CUDA/ABI combo
-  in use, not just "a torch"). Uninstalled rather than left broken.
-  Chasing a working combination wasn't pursued further given it
-  wouldn't help `qwen38_27b`'s hybrid architecture anyway - its
-  `linear_attention` blocks use a completely different mechanism,
-  unaffected by flash attention's `full_attention`-only speedup, which
-  is the model this repo's largest real proof actually uses.
+- [x] **Flash attention** - the OFFICIAL `flash-attn` PyPI package
+  genuinely fails here: `pip install flash-attn --no-build-isolation`
+  builds a wheel successfully (~2-3 min, faster than expected) but the
+  compiled extension fails to import - `undefined symbol:
+  _ZN3c105Error...`, a real C++ ABI mismatch against the installed
+  torch build (a well-known flash-attn pain point - needs a wheel built
+  against the exact torch/CUDA/ABI combo in use). Uninstalled rather
+  than left broken.
+
+  Tried a real alternative instead of stopping there:
+  [ssiu/flash-attention-turing](https://github.com/ssiu/flash-attention-turing),
+  a community FlashAttention implementation specifically for Turing GPUs
+  (compute capability 7.5 - T4, this project's real GPUs). Its raw
+  kernels ARE correct and fast, verified directly, not assumed: forward
+  max diff 0.000488 / backward dQ max diff 0.001953 vs. torch's own
+  SDPA (fp16 numerical noise, not a bug), 1.27x real forward speedup in
+  isolation. Built `flash_attn_turing_shim/` (new, its own README) - a
+  real compatibility package presenting these kernels under the
+  `flash_attn` name/API surface `transformers` imports unconditionally,
+  including the `dropout_p`/`deterministic`/`softcap`/`window_size`
+  argument-adaptation `transformers` always passes (the underlying
+  kernels don't support dropout, softcap, or sliding-window - the shim
+  raises loudly, not silently, if one is actually requested with a
+  non-default value). Verified end-to-end through BOTH `transformers`'
+  regular `model.forward()` AND this repo's own direct-decoder-layer
+  call pattern (`finetune.py`'s `run_decoder_layer`) - real loss, real
+  backward, real gradients either way. Wired into `finetune.py` as
+  `config.attn_implementation` (default `"sdpa"`, unchanged behavior;
+  `rlhf.py`'s `RLHFModelConfig` got the same field since it reuses
+  `build_stage_model` via duck typing).
+
+  **Honest end-to-end result, not oversold**: despite the real 1.27x
+  isolated-kernel speedup, a direct A/B on an actual training run
+  (Qwen2.5-0.5B, 2-stage pipeline) showed NO end-to-end win at this
+  project's actual scale - seq_len=128: 19.3s (sdpa) vs. 22.1s (flash,
+  SLOWER); seq_len=512: 22.6s both (tied). Loss matched closely both
+  times (3.0505 vs 3.0512 at seq_len=128), confirming correctness held
+  in the real training loop, not just the isolated kernel test - the
+  lack of speedup is a real scale finding, not a broken integration.
+  At this model size and batch/seq_len, attention isn't the training
+  step's bottleneck, so a faster attention kernel alone doesn't move
+  total wall-clock time. Kept as a real, validated, opt-in capability
+  (`examples/configs/qwen25_0.5b_lora_flash_attn.yaml`) - worth
+  revisiting at a larger model or longer context where attention is a
+  bigger fraction of the step, which this project hasn't tested. Not
+  useful for `qwen38_27b`'s hybrid architecture regardless of scale -
+  its `linear_attention` blocks use a completely different mechanism,
+  unaffected by flash attention's `full_attention`-only speedup.
 - [x] **Communication/computation overlap** - turned out NOT to need
   Rust work, correcting an earlier wrong assumption in this checklist:
   `process_group.py`'s `isend`/`irecv` (`work.py`, a genuine background-

@@ -99,6 +99,19 @@ class PipelineConfig:
     # environment (peft probing an incompatible torchao unconditionally).
     patch_torchao_check: bool = True
 
+    # Attention implementation passed straight through to
+    # AutoModelForCausalLM.from_pretrained - "sdpa" (default, unchanged
+    # behavior) or "flash_attention_2". The latter requires the
+    # flash_attn_turing_shim/ package (see its own README) on Turing
+    # GPUs (T4 etc.) - the official flash-attn PyPI package hits a real
+    # C++ ABI mismatch in this project's environment (see this repo's
+    # README's training infrastructure checklist), which is why this
+    # field exists rather than assuming plain `pip install flash-attn`
+    # works. See examples/configs/qwen25_0.5b_lora_flash_attn.yaml for
+    # a real, validated example (1.27x real attention forward speedup
+    # measured directly on a T4, correctness-validated against SDPA).
+    attn_implementation: str = "sdpa"
+
     # Dataset - a real HF dataset, tokenized as plain causal-LM text.
     # For anything more structured than "one text field", write batches
     # yourself and call run_pipeline_training's lower-level pieces
@@ -339,16 +352,22 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
             bnb_4bit_quant_type=config.bnb_4bit_quant_type,
             llm_int8_enable_fp32_cpu_offload=config.cpu_offload_unused_layers,
         )
-        model = AutoModelForCausalLM.from_pretrained(config.model_path, quantization_config=bnb_cfg, device_map=device_map)
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_path, quantization_config=bnb_cfg, device_map=device_map,
+            attn_implementation=config.attn_implementation,
+        )
     elif config.quantization == "8bit":
         bnb_cfg = BitsAndBytesConfig(
             load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=config.cpu_offload_unused_layers
         )
         model = AutoModelForCausalLM.from_pretrained(
-            config.model_path, quantization_config=bnb_cfg, device_map=device_map
+            config.model_path, quantization_config=bnb_cfg, device_map=device_map,
+            attn_implementation=config.attn_implementation,
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(config.model_path, dtype=config.torch_dtype).to(f"cuda:{local_gpu}")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_path, dtype=config.torch_dtype, attn_implementation=config.attn_implementation,
+        ).to(f"cuda:{local_gpu}")
 
     lora_cfg = LoraConfig(
         r=config.lora_r, lora_alpha=config.lora_alpha,

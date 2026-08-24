@@ -81,6 +81,12 @@ class RLHFModelConfig:
     cpu_offload_unused_layers: bool = False
     patch_torchao_check: bool = True
 
+    # Same field/default as finetune.PipelineConfig's identical field -
+    # required here too (not just documentation) since build_stage_model()
+    # (finetune.py) is reused unmodified for every RLHF mode below via
+    # duck typing, and now reads config.attn_implementation directly.
+    attn_implementation: str = "sdpa"
+
     connect_timeout_s: int = 300
     log_every: int = 8
     lr: float = 1e-4

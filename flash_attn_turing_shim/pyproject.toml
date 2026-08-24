@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-attn"
+version = "2.99.0"
+description = "Turing-GPU compatibility shim over ssiu/flash-attention-turing, presented under the flash_attn name/API surface transformers expects - see quic_dist's README for why this exists."
+requires-python = ">=3.9"
+dependencies = ["torch", "einops", "flash-attn-turing"]
+
+[tool.setuptools]
+packages = ["flash_attn", "flash_attn.layers"]
+
+[tool.setuptools.package-data]
+flash_attn = ["_turing_interface.py", "_hf_compat.py", "bert_padding.py"]

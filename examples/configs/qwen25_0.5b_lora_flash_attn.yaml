@@ -1,0 +1,45 @@
+# Same model/topology as qwen25_0.5b_lora.yaml, with attn_implementation
+# set to flash_attention_2 - see README.md's training infrastructure
+# checklist for what this actually requires (flash_attn_turing_shim/,
+# a compatibility shim over ssiu/flash-attention-turing's real Turing
+# (T4 etc.) kernels - the official flash-attn PyPI package hits a real
+# C++ ABI mismatch in this project's environment).
+#
+# Honest result from a real, direct comparison (not assumed): the
+# isolated attention kernel IS genuinely faster (1.27x vs torch SDPA,
+# correctness-validated to within fp16 numerical noise), but at this
+# model's actual scale (0.5B, 2-stage pipeline, small batch) attention
+# compute is not the training step's bottleneck - measured NO end-to-
+# end speedup at seq_len=128 (19.3s sdpa vs 22.1s flash - flash was
+# SLOWER) or seq_len=512 (22.6s both, tied). Keep this config around as
+# a real, validated example of the mechanism working correctly - don't
+# expect it to be faster at small scale. Worth revisiting at a larger
+# model/longer context where attention is a bigger fraction of the
+# step, which this project hasn't tested.
+#
+# Requires: LD_LIBRARY_PATH must include torch's lib/ dir at runtime -
+# see flash_attn_turing_shim/README.md.
+#
+# Run: python3 pipeline_finetune_rank.py configs/qwen25_0.5b_lora_flash_attn.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "4bit"
+compute_dtype: float16
+attn_implementation: flash_attention_2
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 256
+text_field: text
+
+seq_len: 128
+batch: 1
+epochs: 1
+lr: 0.0001
