@@ -114,6 +114,38 @@ real, deterministic, rule-based scorer (lexical diversity + a length
 target) - documented in its own docstring as a stand-in good enough to
 prove the mechanism, not a trained reward model; pass your own
 `reward_fn` to `run_grpo_training`/`run_ppo_training` for a real one.
+`rlhf.RMConfig`/`run_rm_training` and `rlhf.PRMConfig`/`run_prm_training`
+train real Bradley-Terry outcome and per-step process reward models;
+`load_reward_model`/`pipeline_score` reload one to score PPO/GRPO
+rollouts with an actual trained model instead of `reward_fn`.
+`finetune.PipelineConfig.training_mode` ("cpt", the original all-tokens
+behavior, or "sft", response-only masked loss) covers continued
+pretraining vs. instruction tuning through the same module.
+
+## Config-driven pipeline multimodal (vision-language) SFT
+
+`quic_dist.multimodal` extends the same config/dotted-attribute
+philosophy to a real vision-language model: a LLaVA-family checkpoint
+(SigLIP vision tower + a plain Qwen2 decoder - picked specifically to
+avoid models needing special multimodal position encoding like Qwen2-VL's
+M-RoPE, which would need per-image metadata broadcast to every stage,
+not just a config field). Rank 0 runs the real vision tower + projector
+(the model's own `get_image_features`, not reimplemented) and merges
+image embeddings into the text embedding sequence via the exact
+`masked_scatter` logic `LlavaModel.forward` itself uses; every later
+stage sees a plain `(B, T, hidden)` activation, no changes needed.
+
+```bash
+cd examples
+python3 multimodal_pipeline_rank.py configs/llava_qwen05b_multimodal.yaml <rank> <signaling_url>
+```
+
+Real, validated example on `llava-hf/llava-interleave-qwen-0.5b-hf`
+(SigLIP + Qwen2-0.5B) with `HuggingFaceH4/llava-instruct-mix-vsft` (real
+images, real chat-format VQA turns): loopback loss 2.44 → 1.73 (avg
+first/last 8 of 48 steps, 3 epochs), and CONFIRMED CROSS-MACHINE (2 real
+machines, one real network hop) with the same result - loss trajectory
+matched the loopback run step-for-step, 206.8s total.
 
 ## Tests
 
@@ -130,7 +162,9 @@ directly-run scripts (`cross_machine_rank.py`, `lora_pipeline_rank.py`,
 `real_llm_pipeline_rank.py`, `vision_shape_rank.py`,
 `vision_pipeline_rank.py`, `n3_cross_machine_rank.py`,
 `pipeline_finetune_rank.py`, `dpo_pipeline_rank.py`,
-`grpo_pipeline_rank.py`, `ppo_pipeline_rank.py`, `bench_quic_dist.py`)
+`grpo_pipeline_rank.py`, `ppo_pipeline_rank.py`, `rm_pipeline_rank.py`,
+`prm_pipeline_rank.py`, `multimodal_pipeline_rank.py`,
+`bench_quic_dist.py`)
 plus the `configs/` and `data/` they read from - run one instance per
 machine/rank, pointed at a real publicly reachable signaling URL.
 

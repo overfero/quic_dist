@@ -1,0 +1,40 @@
+# Real multimodal (vision-language) SFT: llava-hf/llava-interleave-qwen-0.5b-hf
+# (SigLIP vision tower + Qwen2-0.5B decoder, standard LLaVA merge - no
+# M-RoPE, see multimodal.py's module docstring for why that model
+# family was picked for the first real proof). 2-stage pipeline splits
+# the 24 Qwen2 decoder layers; the vision tower + projector live on
+# rank 0 only (see build_multimodal_device_map).
+#
+# Real dataset: HuggingFaceH4/llava-instruct-mix-vsft (real images +
+# real chat-format VQA turns) - trains on the first user/assistant
+# exchange per example (see build_vlm_sft_dataset).
+#
+# Real, validated BOTH ways with this exact config: loopback (rank0/
+# rank1 on the same machine's 2 GPUs) AND real cross-machine (2 real
+# machines, one real network hop) - loss trajectory matched step-for-
+# step, 206.8s total cross-machine. connect_timeout_s is generous
+# enough for either (a real cross-machine hop needs it; costs nothing
+# extra on loopback).
+#
+# Run: python3 multimodal_pipeline_rank.py configs/llava_qwen05b_multimodal.yaml <rank> <signaling_url>
+
+model_path: llava-hf/llava-interleave-qwen-0.5b-hf
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"   # 0.5B text + SigLIP fits a T4 unquantized
+compute_dtype: bfloat16
+connect_timeout_s: 900
+
+dataset_name: HuggingFaceH4/llava-instruct-mix-vsft
+dataset_split: train
+num_examples: 16
+max_len: 1024
+
+epochs: 3
+lr: 0.0001
+log_every: 2

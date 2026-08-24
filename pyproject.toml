@@ -30,6 +30,7 @@ finetune = [
     "accelerate>=0.30",
     "datasets>=2.18",
     "pyyaml>=6.0",
+    "pillow>=10.0",  # quic_dist.multimodal's real image preprocessing (RGB conversion, etc.)
 ]
 
 # The package name (quic_dist) is declared here independent of whatever
