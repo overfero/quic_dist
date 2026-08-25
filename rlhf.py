@@ -1265,6 +1265,116 @@ def build_grpo_prompts(tokenizer, config: GRPOConfig) -> list[torch.Tensor]:
     return prompts
 
 
+def _grpo_update_from_rollout(
+    rank, config: GRPOConfig, peft_model, optimizer, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
+    is_first: bool, is_last: bool, prev_rank, next_rank, tag_ref: int, tag_policy: int,
+    prompt_ids, generated, rewards,
+) -> tuple[float | None, float | None, float | None]:
+    """The actual GRPO update math - teacher-forced ref+policy forward,
+    group-relative advantage, policy-gradient loss + KL penalty,
+    backward, `optimizer.step()`. Factored out of `run_grpo_training`'s
+    own loop body (previously inline there) so
+    `run_grpo_training_from_rollouts` (added for quic-rl's external-
+    rollout integration - see that function's own docstring) can reuse
+    the EXACT same loss computation instead of a second copy of it: the
+    only thing that differs between the two callers is WHERE
+    `prompt_ids`/`generated`/`rewards` came from (this project's own
+    `pipeline_generate`+`reward_fn`/`rm`, vs. an externally-generated-
+    and-scored rollout) - never what happens to them once they're in
+    hand.
+
+    `prompt_ids`: (1, prompt_len). `generated`: (G, N) token ids - same
+    on every rank (see `run_grpo_training`'s existing pattern: every
+    rank already redundantly holds the full prompt/rollout locally, no
+    rank-specific slicing). `rewards`: (G,) float tensor, ONLY required
+    on `is_last` (matches the existing code's own behavior: a non-last
+    rank never reads `rewards` at all, so callers may safely pass `None`
+    for `rewards`/`generated` contents they don't have - only shapes
+    used by ranks that actually touch them matter).
+
+    Returns `(loss, reward_mean, kl)` on the LAST rank, `(None, None,
+    None)` elsewhere - mirrors `run_grpo_training`'s existing is_last-
+    only bookkeeping exactly."""
+    G = generated.shape[0]
+    prompt_len = prompt_ids.shape[1]
+    seq_len = prompt_len + generated.shape[1] - 1  # predicting next-token, same -1 convention as elsewhere
+
+    if is_first:
+        full_ids = torch.cat([prompt_ids.expand(G, -1), generated], dim=1).to(device)  # (G, prompt_len+N)
+
+    if is_last:
+        advantage = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+        reward_mean = rewards.mean().item()
+
+    # Teacher-forced forward over prompt+generated: policy (grad) and
+    # reference (no grad, adapters disabled - same free-reference trick
+    # as DPO) - to get the on-policy logp of exactly the tokens that
+    # were just sampled.
+    def forced_forward(tag, no_grad):
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(G, -1)
+        ctx = torch.no_grad() if no_grad else torch.enable_grad()
+        with ctx:
+            if is_first:
+                hidden = embed(full_ids[:, :-1]).to(config.torch_dtype)
+                hidden_in = None
+            else:
+                recv_buf = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
+                dist.recv(recv_buf, src=prev_rank, tag=tag)
+                hidden_in = recv_buf.to(device)
+                if not no_grad:
+                    hidden_in = hidden_in.requires_grad_(True)
+                hidden = hidden_in
+            pos_emb = rotary(hidden, position_ids) if rotary is not None else None
+            out = hidden
+            for layer in stage_layers:
+                out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
+            if is_last:
+                out = norm(out)
+                logits = lm_head(out.to(lm_head.weight.dtype))
+                return logits, hidden_in
+            dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
+            return out, hidden_in
+
+    optimizer.zero_grad()
+    with peft_model.disable_adapter():
+        ref_out, _ = forced_forward(tag_ref, no_grad=True)
+    policy_out, hidden_in = forced_forward(tag_policy, no_grad=False)
+
+    loss_value = kl_value = None
+    if is_last:
+        resp_start = prompt_len - 1  # logits[:, resp_start] predicts the first generated token
+        resp_logits_p = policy_out[:, resp_start:, :]
+        resp_logits_r = ref_out[:, resp_start:, :]
+        resp_labels = generated.to(device)  # full_ids[:, prompt_len:] by construction - see pipeline_generate's docstring
+        logp_policy = F.log_softmax(resp_logits_p.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
+        logp_ref = F.log_softmax(resp_logits_r.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
+        kl = (logp_policy - logp_ref)  # (G, N) - k1 estimator, per-token
+
+        # Single-rollout-per-update simplification: the policy that
+        # generated these samples IS the policy being updated (no
+        # multiple inner PPO-clip epochs, unlike run_ppo_training
+        # below), so the importance ratio is exactly 1 and this
+        # reduces to REINFORCE with a group-relative baseline plus
+        # a KL-to-reference penalty - the real GRPO objective minus
+        # its clip term, which only does something across >1 update
+        # per rollout.
+        pg_loss = -(advantage.to(device).unsqueeze(1) * logp_policy).mean()
+        loss = pg_loss + config.kl_coef * kl.mean()
+        loss.backward()
+        loss_value = loss.item()
+        kl_value = kl.mean().item()
+    else:
+        grad = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
+        dist.recv(grad, src=next_rank, tag=tag_policy)
+        policy_out.backward(grad.to(device))
+
+    if not is_first:
+        dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
+
+    optimizer.step()
+    return loss_value, (reward_mean if is_last else None), kl_value
+
+
 def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id: str = "grpo_pipeline",
                        reward_fn=default_reward_fn, rm: "LoadedRewardModel | None" = None) -> list[float]:
     """`rm`, when given (see load_reward_model()), scores each rollout
@@ -1344,9 +1454,11 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
             )
             peft_model.train()
 
-            prompt_len = prompt_ids.shape[1]
-            seq_len = prompt_len + config.max_new_tokens - 1  # predicting next-token, same -1 convention as elsewhere
-
+            # Only needed for `rm_input` below (the reward-MODEL scoring
+            # path) - `_grpo_update_from_rollout` recomputes its own
+            # prompt_len/seq_len/full_ids internally from
+            # prompt_ids/generated directly, so this outer copy is no
+            # longer used for the loss computation itself, just this.
             if is_first:
                 full_ids = torch.cat([prompt_ids.expand(G, -1), generated], dim=1).to(device)  # (G, prompt_len+N)
 
@@ -1369,78 +1481,19 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
                 texts = [tokenizer.decode(generated[g], skip_special_tokens=True) for g in range(G)]
                 rewards = torch.tensor([reward_fn(t) for t in texts], dtype=torch.float32)
 
+            loss_value, reward_mean, kl_value = _grpo_update_from_rollout(
+                rank, config, peft_model, optimizer, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
+                is_first, is_last, prev_rank, next_rank, tag_ref, tag_policy,
+                prompt_ids, generated, rewards if is_last else None,
+            )
             if is_last:
-                advantage = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
-                rewards_log.append(rewards.mean().item())
+                losses.append(loss_value)
+                rewards_log.append(reward_mean)
 
-            # --- 3. teacher-forced forward over prompt+generated: policy
-            # (grad) and reference (no grad, adapters disabled - same
-            # free-reference trick as DPO) - to get the on-policy logp of
-            # exactly the tokens that were just sampled. ---
-            def forced_forward(tag, no_grad):
-                position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(G, -1)
-                ctx = torch.no_grad() if no_grad else torch.enable_grad()
-                with ctx:
-                    if is_first:
-                        hidden = embed(full_ids[:, :-1]).to(config.torch_dtype)
-                        hidden_in = None
-                    else:
-                        recv_buf = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
-                        dist.recv(recv_buf, src=prev_rank, tag=tag)
-                        hidden_in = recv_buf.to(device)
-                        if not no_grad:
-                            hidden_in = hidden_in.requires_grad_(True)
-                        hidden = hidden_in
-                    pos_emb = rotary(hidden, position_ids) if rotary is not None else None
-                    out = hidden
-                    for layer in stage_layers:
-                        out = run_decoder_layer(layer, out, attention_mask=None, position_ids=position_ids, position_embeddings=pos_emb)
-                    if is_last:
-                        out = norm(out)
-                        logits = lm_head(out.to(lm_head.weight.dtype))
-                        return logits, hidden_in
-                    dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
-                    return out, hidden_in
-
-            optimizer.zero_grad()
-            with peft_model.disable_adapter():
-                ref_out, _ = forced_forward(tag_ref, no_grad=True)
-            policy_out, hidden_in = forced_forward(tag_policy, no_grad=False)
-
-            if is_last:
-                resp_start = prompt_len - 1  # logits[:, resp_start] predicts the first generated token
-                resp_logits_p = policy_out[:, resp_start:, :]
-                resp_logits_r = ref_out[:, resp_start:, :]
-                resp_labels = generated.to(device)  # full_ids[:, prompt_len:] by construction - see pipeline_generate's docstring
-                logp_policy = F.log_softmax(resp_logits_p.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
-                logp_ref = F.log_softmax(resp_logits_r.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
-                kl = (logp_policy - logp_ref)  # (G, N) - k1 estimator, per-token
-
-                # Single-rollout-per-update simplification: the policy that
-                # generated these samples IS the policy being updated (no
-                # multiple inner PPO-clip epochs, unlike run_ppo_training
-                # below), so the importance ratio is exactly 1 and this
-                # reduces to REINFORCE with a group-relative baseline plus
-                # a KL-to-reference penalty - the real GRPO objective minus
-                # its clip term, which only does something across >1 update
-                # per rollout.
-                pg_loss = -(advantage.to(device).unsqueeze(1) * logp_policy).mean()
-                loss = pg_loss + config.kl_coef * kl.mean()
-                loss.backward()
-                losses.append(loss.item())
-            else:
-                grad = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
-                dist.recv(grad, src=next_rank, tag=tag_policy)
-                policy_out.backward(grad.to(device))
-
-            if not is_first:
-                dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
-
-            optimizer.step()
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
-                    msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl.mean().item():.4f}"
+                    msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl_value:.4f}"
                 print(msg, flush=True)
 
         elapsed = time.monotonic() - t_start
@@ -1452,6 +1505,118 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
 
     total_elapsed = time.monotonic() - t_start
     print(f"[rank {rank}] GRPO training DONE in {total_elapsed:.1f}s ({total_steps} steps)", flush=True)
+    if is_last and rewards_log:
+        print(f"[rank {rank}] reward avg first {min(8,len(rewards_log))} steps: {sum(rewards_log[:8])/min(8,len(rewards_log)):.4f}", flush=True)
+        print(f"[rank {rank}] reward avg last {min(8,len(rewards_log))} steps:  {sum(rewards_log[-8:])/min(8,len(rewards_log)):.4f}", flush=True)
+
+    _teardown(rank)
+    return losses
+
+
+@dataclass
+class RolloutBatch:
+    """One externally-generated GRPO rollout, ready to train on directly
+    - what `run_grpo_training_from_rollouts` consumes instead of calling
+    `pipeline_generate` itself. Field shapes/dtypes match exactly what
+    `run_grpo_training`'s own internal generation already produces (see
+    `_grpo_update_from_rollout`'s docstring), so nothing downstream needs
+    to know which path produced them."""
+
+    prompt_ids: torch.Tensor  # (1, prompt_len), long, CPU
+    generated: torch.Tensor   # (G, N), long, CPU - G sampled completions, same length N
+    rewards: torch.Tensor     # (G,), float32 - already scored (e.g. by quic-rl's RewardBackend)
+
+
+def run_grpo_training_from_rollouts(
+    rank: int, signaling_url: str, config: GRPOConfig, rollout_source, job_id: str = "grpo_pipeline_external",
+    max_steps: int | None = None,
+) -> list[float]:
+    """GRPO training on EXTERNALLY-generated rollouts (e.g. quic-rl's
+    `QuicVLLMRollout`, real vLLM-served generation, scored by quic-rl's
+    own `RewardBackend`) instead of this project's own in-process
+    `pipeline_generate`. Added as the smallest integration surface for
+    that use case - reuses the EXACT SAME GRPO loss computation as
+    `run_grpo_training` (`_grpo_update_from_rollout`, factored out of
+    that function's own loop body for this reason - see its docstring):
+    only the SOURCE of `(prompt_ids, generated, rewards)` differs,
+    nothing about the actual update math. `run_grpo_training` itself is
+    completely unchanged by this addition - same behavior, same call
+    sites, same tests.
+
+    `rollout_source`: any iterable of `RolloutBatch` - e.g. a generator
+    reading `torch.save()`'d files from a directory an external
+    orchestrator writes to (this project's own established file-based
+    convention - checkpoints/configs already work this way, see
+    `training_utils.py` - not a new network protocol invented here).
+    EVERY rank's process must be handed an EQUIVALENT `rollout_source`
+    (the same sequence of batches, in the same order) - this function
+    does not itself broadcast rollout data between ranks, matching
+    `run_grpo_training`'s own existing pattern where every rank
+    redundantly builds the identical prompt/rollout data locally rather
+    than one rank distributing it to the others.
+
+    `max_steps`: stops after this many batches even if `rollout_source`
+    has more (or is infinite/streaming) - `None` (default) consumes
+    `rollout_source` until exhausted (`StopIteration`).
+
+    No seed/checkpoint/log wiring here, deliberately matching
+    `run_grpo_training`'s own current scope - GRPO doesn't have that
+    wired into either path yet (see the development log's "wire seed/
+    logging/checkpoint+resume into rlhf.py's remaining modes" item);
+    adding it is real future work, not something this integration point
+    should invent as a side effect."""
+    local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = _init_rank(
+        rank, signaling_url, config, job_id
+    )
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+    prev_rank = rank - 1 if rank > 0 else None
+    next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    # See run_grpo_training's identical barrier for why: without this, a
+    # fast-loading rank can start sending real tensors before a slow-
+    # loading rank finishes, and the QUIC connection's own idle timeout
+    # closes it before the slow rank ever gets there.
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training (external rollouts)", flush=True)
+
+    trainable = [p for p in peft_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+
+    losses: list[float] = []
+    rewards_log: list[float] = []
+    t_start = time.monotonic()
+    step_counter = 0
+
+    for batch in rollout_source:
+        if max_steps is not None and step_counter >= max_steps:
+            break
+
+        # See run_grpo_training's identical per-step barrier for why a
+        # real per-step barrier is needed here, not a second
+        # dist.barrier() call.
+        _step_barrier(signaling_url, config, f"grpo_ext_{step_counter + 1}", job_id=job_id)
+        step_counter += 1
+        tag_ref = (step_counter % 4) * 2
+        tag_policy = tag_ref + 1
+
+        loss_value, reward_mean, kl_value = _grpo_update_from_rollout(
+            rank, config, peft_model, optimizer, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
+            is_first, is_last, prev_rank, next_rank, tag_ref, tag_policy,
+            batch.prompt_ids, batch.generated, batch.rewards if is_last else None,
+        )
+        if is_last:
+            losses.append(loss_value)
+            rewards_log.append(reward_mean)
+
+        if step_counter <= 3 or step_counter % config.log_every == 0:
+            msg = f"[rank {rank}] step {step_counter}"
+            if is_last:
+                msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl_value:.4f}"
+            print(msg, flush=True)
+
+    elapsed = time.monotonic() - t_start
+    print(f"[rank {rank}] GRPO (external rollouts) training DONE in {elapsed:.1f}s ({step_counter} steps)", flush=True)
     if is_last and rewards_log:
         print(f"[rank {rank}] reward avg first {min(8,len(rewards_log))} steps: {sum(rewards_log[:8])/min(8,len(rewards_log)):.4f}", flush=True)
         print(f"[rank {rank}] reward avg last {min(8,len(rewards_log))} steps:  {sum(rewards_log[-8:])/min(8,len(rewards_log)):.4f}", flush=True)

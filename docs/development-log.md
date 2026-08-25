@@ -388,6 +388,50 @@ yet done.
     worth a real run before relying on either in production, same
     honesty standard as every other item in this file.
 
+- [x] **External-rollout GRPO entry point** (`rlhf.run_grpo_training_from_rollouts`,
+  `rlhf.RolloutBatch`) - the integration surface for `quic-rl`, a
+  separate orchestration repo built on top of this project and
+  `quic-vllm` for online RL (quic-vllm generates rollouts -> quic-rl
+  scores them -> this project trains -> quic-rl syncs the updated policy
+  back). `run_grpo_training` used to be the ONLY GRPO entry point and was
+  monolithic: it called `pipeline_generate` itself, in-process, using
+  this project's own pipeline-parallel model - there was no way to feed
+  it externally-generated `(prompt, response, reward)` triples instead.
+
+  Rather than duplicate GRPO's actual loss math into the new repo (the
+  explicit thing that integration was designed NOT to do), the existing
+  loop's loss-computation body - teacher-forced ref+policy forward,
+  group-relative advantage, `pg_loss`/KL, backward, `optimizer.step()` -
+  was factored out into `_grpo_update_from_rollout`, a shared helper both
+  `run_grpo_training` and the new `run_grpo_training_from_rollouts` call.
+  `run_grpo_training`'s own behavior, call sites, and tests are
+  completely unchanged - same function, same tag scheme, same barrier
+  discipline, verified with a real 2-rank Qwen2.5-0.5B run (16/16 GRPO
+  steps, real loss/reward/KL trajectory) after the refactor, not just
+  read-through.
+
+  `run_grpo_training_from_rollouts` takes any iterable of `RolloutBatch`
+  (`prompt_ids`/`generated`/`rewards` - the exact shapes
+  `pipeline_generate` already produces, so nothing downstream needs to
+  know which path produced them) instead of calling `pipeline_generate`
+  - every rank's process gets an equivalent `rollout_source`, matching
+  this project's own existing "every rank redundantly builds the
+  identical data locally" pattern rather than one rank broadcasting to
+  the others. Validated with a real, separate 2-rank run (same model,
+  synthetic-but-real rollout data with a deliberately-non-uniform reward
+  per group member): real backward/optimizer.step() every step, real
+  non-NaN loss values, and `reward_mean` in the logs matched the exact
+  mean of the synthetic rewards handed in - direct confirmation the
+  reward data flows through the group-relative advantage computation
+  correctly, not just "didn't crash."
+
+  No seed/checkpoint/log wiring added to either GRPO path as part of
+  this - GRPO didn't have that wired in before this change either (see
+  the earlier "wire seed/logging/checkpoint+resume into rlhf.py's
+  remaining modes" item, still open); adding it is real, separate future
+  work, not something this integration point should invent as a side
+  effect.
+
 ## Known limitations
 
 Consolidated here (used to be a single broken external link):
