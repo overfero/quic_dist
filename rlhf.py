@@ -1529,7 +1529,7 @@ class RolloutBatch:
 
 def run_grpo_training_from_rollouts(
     rank: int, signaling_url: str, config: GRPOConfig, rollout_source, job_id: str = "grpo_pipeline_external",
-    max_steps: int | None = None,
+    max_steps: int | None = None, on_step_result=None,
 ) -> list[float]:
     """GRPO training on EXTERNALLY-generated rollouts (e.g. quic-rl's
     `QuicVLLMRollout`, real vLLM-served generation, scored by quic-rl's
@@ -1558,6 +1558,17 @@ def run_grpo_training_from_rollouts(
     `max_steps`: stops after this many batches even if `rollout_source`
     has more (or is infinite/streaming) - `None` (default) consumes
     `rollout_source` until exhausted (`StopIteration`).
+
+    `on_step_result`: optional `(step_counter, loss_value, reward_mean,
+    kl_value) -> None`, called right after each step's
+    `_grpo_update_from_rollout` returns (same is_last-only-else-None
+    values as this function's own `losses`/`rewards_log` bookkeeping).
+    The only way a caller can observe a step's real result as it
+    happens rather than waiting for this function to return its full
+    `losses` list at the very end - e.g. quic-rl's launcher script uses
+    it to write a per-step result file the orchestrator process polls
+    for. Default `None` (no callback) leaves existing behavior and
+    every other caller of this function completely unchanged.
 
     No seed/checkpoint/log wiring here, deliberately matching
     `run_grpo_training`'s own current scope - GRPO doesn't have that
@@ -1608,6 +1619,9 @@ def run_grpo_training_from_rollouts(
         if is_last:
             losses.append(loss_value)
             rewards_log.append(reward_mean)
+
+        if on_step_result is not None:
+            on_step_result(step_counter, loss_value, reward_mean, kl_value)
 
         if step_counter <= 3 or step_counter % config.log_every == 0:
             msg = f"[rank {rank}] step {step_counter}"
