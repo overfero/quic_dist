@@ -1576,7 +1576,7 @@ class RolloutBatch:
 
 def run_grpo_training_from_rollouts(
     rank: int, signaling_url: str, config: GRPOConfig, rollout_source, job_id: str = "grpo_pipeline_external",
-    max_steps: int | None = None, on_step_result=None,
+    max_steps: int | None = None, on_step_result=None, on_checkpoint=None,
 ) -> list[float]:
     """GRPO training on EXTERNALLY-generated rollouts (e.g. quic-rl's
     `QuicVLLMRollout`, real vLLM-served generation, scored by quic-rl's
@@ -1626,12 +1626,38 @@ def run_grpo_training_from_rollouts(
     for. Default `None` (no callback) leaves existing behavior and
     every other caller of this function completely unchanged.
 
-    No seed/checkpoint/log wiring here, deliberately matching
-    `run_grpo_training`'s own current scope - GRPO doesn't have that
-    wired into either path yet (see the development log's "wire seed/
-    logging/checkpoint+resume into rlhf.py's remaining modes" item);
-    adding it is real future work, not something this integration point
-    should invent as a side effect."""
+    `config.checkpoint_dir` (optional, same field every other RLHF mode
+    already uses): if set, every rank saves a REAL checkpoint (via
+    `training_utils.save_checkpoint` - the exact trainable-params-only
+    convention every other mode uses, `full_finetune=True` just means
+    that's every real parameter) right after each real `optimizer.step()`
+    - i.e. once per accumulation WINDOW, not per micro-batch
+    (`config.checkpoint_every` is interpreted in windows here, not raw
+    steps, since a caller polling for weights only cares about points
+    where the model actually changed). This is what makes
+    `QuicTrainBackend.export_policy()` possible: by the time `train()`'s
+    `_wait_for_result()` sees a step's result file, the corresponding
+    checkpoint is already safely on disk (checkpoint save happens
+    BEFORE `on_step_result` fires, deliberately, for exactly this
+    reason). No seed/log wiring yet - only checkpointing, the piece
+    quic-rl's weight-sync-back actually needed.
+
+    `on_checkpoint`: optional `(rank, peft_model) -> None`, called right
+    after each checkpoint's own barrier (so every rank's checkpoint
+    write has already finished - same guarantee `on_step_result` gets).
+    The real reason this exists: a caller that needs the model in HF
+    format (e.g. `QuicTrainBackend.export_policy()`) can serialize
+    DIRECTLY from this already-GPU-resident `peft_model` instead of
+    loading a SECOND full copy of the model into its own (separate)
+    process - a real RAM-exhaustion bug found running this for real
+    (rank processes never exit between `train()` calls, so a second
+    orchestrator-side `AutoModelForCausalLM.from_pretrained()` call
+    while both rank processes are still alive pushed a real machine
+    over its actual RAM ceiling). Called on EVERY rank whenever a
+    checkpoint fires (not just is_last) since `on_checkpoint`'s own
+    caller decides which rank(s) need to act, mirroring how only rank 0
+    needs to act on `export_policy()`'s read side today given the same
+    full_finetune non-sharding reality documented there."""
     local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = _init_rank(
         rank, signaling_url, config, job_id
     )
@@ -1656,6 +1682,11 @@ def run_grpo_training_from_rollouts(
     step_counter = 0
     accum_steps = max(1, config.gradient_accumulation_steps)
     micro_step_in_window = 0  # 0..accum_steps-1; wraps to 0 right after a real optimizer.step()
+    window_counter = 0  # counts real optimizer.step()s, NOT micro-steps - what checkpoint_every gates here
+    best_reward_mean = float("-inf")  # tracks the "best" checkpoint - see the checkpoint block's own comment
+
+    if config.checkpoint_dir:
+        from training_utils import CheckpointState, save_checkpoint
 
     for batch in rollout_source:
         if max_steps is not None and step_counter >= max_steps:
@@ -1688,6 +1719,48 @@ def run_grpo_training_from_rollouts(
             losses.append(loss_value)
             rewards_log.append(reward_mean)
 
+        if is_window_end:
+            window_counter += 1
+            # Deliberately BEFORE on_step_result: a caller (e.g.
+            # QuicTrainBackend) polling the result file this callback
+            # writes must never observe "step done" before the
+            # corresponding checkpoint is actually on disk.
+            if config.checkpoint_dir and config.checkpoint_every > 0 and window_counter % config.checkpoint_every == 0:
+                # Only is_last actually knows reward_mean (see
+                # _grpo_update_from_rollout's own is_last-only return
+                # contract) - broadcast it so every rank makes the SAME
+                # "is this the best checkpoint so far" decision, since
+                # every rank must independently write its own best-copy
+                # (each rank checkpoints its own layer slice/full model).
+                reward_tensor = torch.tensor([reward_mean if is_last else 0.0], dtype=torch.float64)
+                dist.broadcast(reward_tensor, src=config.world_size - 1)
+                is_best = reward_tensor.item() > best_reward_mean
+                if is_best:
+                    best_reward_mean = reward_tensor.item()
+
+                ckpt_path = save_checkpoint(
+                    config.checkpoint_dir, rank, peft_model, optimizer,
+                    CheckpointState(step=window_counter, epoch=0, batch_index=step_counter),
+                    keep_last=config.checkpoint_keep_last, as_best=is_best,
+                )
+                print(f"[rank {rank}] checkpoint saved: {ckpt_path}"
+                      + (" (new best)" if is_best else ""), flush=True)
+                # Real race found running this for real: a caller reads
+                # rank 0's checkpoint specifically (every rank holds the
+                # full model in full_finetune mode - see
+                # QuicTrainBackend.export_policy()'s own comment), but
+                # only is_last's on_step_result actually becomes visible
+                # to that caller - nothing previously guaranteed rank 0
+                # had FINISHED its own (much larger, ~7GB) save_checkpoint
+                # call by the time is_last's result file appeared, so a
+                # reader could open a still-being-written file and hit a
+                # real "failed finding central directory" torch.load()
+                # error. This barrier makes every rank wait for every
+                # OTHER rank's save_checkpoint to actually finish first.
+                _step_barrier(signaling_url, config, f"grpo_ext_ckpt_{window_counter}", job_id=job_id)
+                if on_checkpoint is not None:
+                    on_checkpoint(rank, peft_model)
+
         if on_step_result is not None:
             on_step_result(step_counter, loss_value, reward_mean, kl_value)
 
@@ -1704,6 +1777,24 @@ def run_grpo_training_from_rollouts(
         # rank does this identically (accum_steps/step_counter are the
         # same everywhere), so it can't desync the pipeline.
         optimizer.step()
+        window_counter += 1
+        if config.checkpoint_dir and config.checkpoint_every > 0 and window_counter % config.checkpoint_every == 0:
+            reward_tensor = torch.tensor([reward_mean if is_last else 0.0], dtype=torch.float64)
+            dist.broadcast(reward_tensor, src=config.world_size - 1)
+            is_best = reward_tensor.item() > best_reward_mean
+            if is_best:
+                best_reward_mean = reward_tensor.item()
+
+            ckpt_path = save_checkpoint(
+                config.checkpoint_dir, rank, peft_model, optimizer,
+                CheckpointState(step=window_counter, epoch=0, batch_index=step_counter),
+                keep_last=config.checkpoint_keep_last, as_best=is_best,
+            )
+            print(f"[rank {rank}] checkpoint saved (trailing flush): {ckpt_path}"
+                  + (" (new best)" if is_best else ""), flush=True)
+            _step_barrier(signaling_url, config, f"grpo_ext_ckpt_{window_counter}", job_id=job_id)
+            if on_checkpoint is not None:
+                on_checkpoint(rank, peft_model)
 
     elapsed = time.monotonic() - t_start
     print(f"[rank {rank}] GRPO (external rollouts) training DONE in {elapsed:.1f}s ({step_counter} steps)", flush=True)

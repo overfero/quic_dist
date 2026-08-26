@@ -159,11 +159,20 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     state: CheckpointState,
     keep_last: int = 2,
+    as_best: bool = False,
 ) -> str:
-    """Writes `<checkpoint_dir>/rank<rank>_step<step>.pt` and prunes
-    older ones for THIS rank beyond `keep_last` - a run left running
-    unattended must not be the next thing that fills the disk via its
-    own checkpoints. Returns the path written."""
+    """Writes `<checkpoint_dir>/rank<rank>_step<step>.pt` (the "last N"
+    rotation, pruning older ones for THIS rank beyond `keep_last` - a run
+    left running unattended must not be the next thing that fills the
+    disk via its own checkpoints) and, when `as_best=True`, ALSO copies
+    that same file to `<checkpoint_dir>/rank<rank>_best.pt` - a SEPARATE
+    file outside the "last N" rotation/glob pattern, so the best-so-far
+    checkpoint survives even after training has moved well past it and
+    rotated the corresponding step-numbered file away. Callers decide
+    "is this the best" themselves (e.g. by tracking a validation metric)
+    - this function only knows how to WRITE the extra copy, not what
+    "best" means. Returns the `rank<rank>_step<step>.pt` path written
+    (the same as when `as_best=False`)."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     ckpt = {
         "step": state.step,
@@ -176,6 +185,12 @@ def save_checkpoint(
     }
     path = os.path.join(checkpoint_dir, f"rank{rank}_step{state.step}.pt")
     torch.save(ckpt, path)
+
+    if as_best:
+        best_path = os.path.join(checkpoint_dir, f"rank{rank}_best.pt")
+        tmp_path = best_path + ".tmp"
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, best_path)  # atomic - a reader never sees a partial "best" file
 
     existing = sorted(
         Path(checkpoint_dir).glob(f"rank{rank}_step*.pt"),
@@ -194,6 +209,16 @@ def find_latest_checkpoint(checkpoint_dir: str, rank: int) -> str | None:
         key=lambda p: int(p.stem.split("step")[-1]),
     )
     return str(candidates[-1]) if candidates else None
+
+
+def find_best_checkpoint(checkpoint_dir: str, rank: int) -> str | None:
+    """Companion to find_latest_checkpoint() - the file save_checkpoint()
+    writes when called with as_best=True. None if no checkpoint has ever
+    been saved as best yet (a real, expected state early in a run, not
+    an error - callers should fall back to find_latest_checkpoint() in
+    that case if they need SOME checkpoint to resume from)."""
+    path = Path(checkpoint_dir) / f"rank{rank}_best.pt"
+    return str(path) if path.exists() else None
 
 
 def load_checkpoint(
