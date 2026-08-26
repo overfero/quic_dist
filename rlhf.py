@@ -75,6 +75,13 @@ class RLHFModelConfig:
     lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     lora_dropout: float = 0.0
 
+    # See finetune.PipelineConfig's identical field for the real
+    # rationale (build_stage_model() is shared, reads this by duck
+    # typing) - requires quantization="none", and (for the GRPO path
+    # specifically) kl_coef=0.0 since there's no adapter for the
+    # free-reference-model trick to disable.
+    full_finetune: bool = False
+
     quantization: str = "4bit"
     bnb_4bit_quant_type: str = "nf4"
     compute_dtype: str = "bfloat16"
@@ -1247,6 +1254,12 @@ class GRPOConfig(RLHFModelConfig):
     kl_coef: float = 0.05
     epochs: int = 1
 
+    # Micro-steps (one per prompt group) accumulated before optimizer.step() -
+    # see run_grpo_training_from_rollouts's own docstring for the exact
+    # windowing/flush semantics. 1 (default) = a step() after every
+    # micro-batch, this class's existing behavior, completely unchanged.
+    gradient_accumulation_steps: int = 1
+
     @classmethod
     def from_file(cls, path: str) -> "GRPOConfig":
         return cls(**cls._load_raw(path))
@@ -1269,6 +1282,7 @@ def _grpo_update_from_rollout(
     rank, config: GRPOConfig, peft_model, optimizer, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
     is_first: bool, is_last: bool, prev_rank, next_rank, tag_ref: int, tag_policy: int,
     prompt_ids, generated, rewards,
+    zero_grad: bool = True, do_step: bool = True, loss_scale: float = 1.0,
 ) -> tuple[float | None, float | None, float | None]:
     """The actual GRPO update math - teacher-forced ref+policy forward,
     group-relative advantage, policy-gradient loss + KL penalty,
@@ -1294,7 +1308,22 @@ def _grpo_update_from_rollout(
 
     Returns `(loss, reward_mean, kl)` on the LAST rank, `(None, None,
     None)` elsewhere - mirrors `run_grpo_training`'s existing is_last-
-    only bookkeeping exactly."""
+    only bookkeeping exactly.
+
+    `zero_grad`/`do_step`/`loss_scale`: gradient-accumulation support for
+    `run_grpo_training_from_rollouts` - PyTorch's `.backward()` already
+    accumulates into `.grad` across calls with no `zero_grad()` in
+    between, so accumulating N micro-batches' gradients before ONE real
+    `optimizer.step()` needs nothing here beyond NOT calling
+    `zero_grad()`/`step()` on every call, and scaling the loss by
+    `1/N` first so the accumulated gradient is an average over the N
+    micro-batches, not their sum (matches every other gradient-accumulation
+    implementation's convention). `loss_value` returned is always the
+    real UNSCALED per-micro-batch loss (what actually gets logged),
+    regardless of `loss_scale` - only the tensor that flows into
+    `.backward()` is scaled. `run_grpo_training`'s own call site passes
+    none of these (all default to their pre-existing values), so its
+    behavior is completely unchanged."""
     G = generated.shape[0]
     prompt_len = prompt_ids.shape[1]
     seq_len = prompt_len + generated.shape[1] - 1  # predicting next-token, same -1 convention as elsewhere
@@ -1335,20 +1364,38 @@ def _grpo_update_from_rollout(
             dist.send(out.detach().to(config.torch_dtype).cpu(), dst=next_rank, tag=tag)
             return out, hidden_in
 
-    optimizer.zero_grad()
-    with peft_model.disable_adapter():
-        ref_out, _ = forced_forward(tag_ref, no_grad=True)
+    if zero_grad:
+        optimizer.zero_grad()
+    # kl_coef==0 skips the reference forward pass ENTIRELY (every rank,
+    # consistently - config.kl_coef is the same value everywhere, so
+    # this decision can't desync the pipeline's send/recv tags) rather
+    # than compute a KL term that would just get multiplied by zero: a
+    # real perf win on its own, and the only thing that makes
+    # full_finetune=True (see finetune.PipelineConfig's own docstring)
+    # usable here at all - a full-parameter model has no LoRA adapter
+    # for peft_model.disable_adapter() to disable.
+    if config.kl_coef != 0:
+        with peft_model.disable_adapter():
+            ref_out, _ = forced_forward(tag_ref, no_grad=True)
+    else:
+        ref_out = None
     policy_out, hidden_in = forced_forward(tag_policy, no_grad=False)
 
     loss_value = kl_value = None
     if is_last:
         resp_start = prompt_len - 1  # logits[:, resp_start] predicts the first generated token
         resp_logits_p = policy_out[:, resp_start:, :]
-        resp_logits_r = ref_out[:, resp_start:, :]
         resp_labels = generated.to(device)  # full_ids[:, prompt_len:] by construction - see pipeline_generate's docstring
         logp_policy = F.log_softmax(resp_logits_p.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
-        logp_ref = F.log_softmax(resp_logits_r.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
-        kl = (logp_policy - logp_ref)  # (G, N) - k1 estimator, per-token
+
+        if ref_out is not None:
+            resp_logits_r = ref_out[:, resp_start:, :]
+            logp_ref = F.log_softmax(resp_logits_r.float(), dim=-1).gather(-1, resp_labels.unsqueeze(-1)).squeeze(-1)
+            kl = (logp_policy - logp_ref)  # (G, N) - k1 estimator, per-token
+            kl_value = kl.mean().item()
+            kl_term = config.kl_coef * kl.mean()
+        else:
+            kl_term = 0.0
 
         # Single-rollout-per-update simplification: the policy that
         # generated these samples IS the policy being updated (no
@@ -1359,10 +1406,9 @@ def _grpo_update_from_rollout(
         # its clip term, which only does something across >1 update
         # per rollout.
         pg_loss = -(advantage.to(device).unsqueeze(1) * logp_policy).mean()
-        loss = pg_loss + config.kl_coef * kl.mean()
-        loss.backward()
-        loss_value = loss.item()
-        kl_value = kl.mean().item()
+        loss = pg_loss + kl_term
+        loss_value = loss.item()  # unscaled - see loss_scale's own docstring above
+        (loss * loss_scale).backward()
     else:
         grad = torch.zeros(G, seq_len, hidden_size, dtype=config.torch_dtype)
         dist.recv(grad, src=next_rank, tag=tag_policy)
@@ -1371,7 +1417,8 @@ def _grpo_update_from_rollout(
     if not is_first:
         dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
 
-    optimizer.step()
+    if do_step:
+        optimizer.step()
     return loss_value, (reward_mean if is_last else None), kl_value
 
 
@@ -1555,6 +1602,15 @@ def run_grpo_training_from_rollouts(
     redundantly builds the identical prompt/rollout data locally rather
     than one rank distributing it to the others.
 
+    `config.gradient_accumulation_steps` (default 1): accumulates that
+    many consecutive `RolloutBatch` micro-steps' gradients before one
+    real `optimizer.step()`, instead of stepping after every single
+    prompt group - see `_grpo_update_from_rollout`'s own docstring for
+    the zero_grad/do_step/loss_scale mechanics. A trailing partial
+    window (rollout_source exhausted, or `max_steps` cut it off,
+    mid-window) is flushed with one final `optimizer.step()` rather
+    than silently discarded.
+
     `max_steps`: stops after this many batches even if `rollout_source`
     has more (or is infinite/streaming) - `None` (default) consumes
     `rollout_source` until exhausted (`StopIteration`).
@@ -1598,6 +1654,8 @@ def run_grpo_training_from_rollouts(
     rewards_log: list[float] = []
     t_start = time.monotonic()
     step_counter = 0
+    accum_steps = max(1, config.gradient_accumulation_steps)
+    micro_step_in_window = 0  # 0..accum_steps-1; wraps to 0 right after a real optimizer.step()
 
     for batch in rollout_source:
         if max_steps is not None and step_counter >= max_steps:
@@ -1611,10 +1669,20 @@ def run_grpo_training_from_rollouts(
         tag_ref = (step_counter % 4) * 2
         tag_policy = tag_ref + 1
 
+        is_window_start = micro_step_in_window == 0
+        micro_step_in_window += 1
+        is_window_end = (
+            micro_step_in_window == accum_steps
+            or (max_steps is not None and step_counter >= max_steps)
+        )
+        if is_window_end:
+            micro_step_in_window = 0
+
         loss_value, reward_mean, kl_value = _grpo_update_from_rollout(
             rank, config, peft_model, optimizer, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
             is_first, is_last, prev_rank, next_rank, tag_ref, tag_policy,
             batch.prompt_ids, batch.generated, batch.rewards if is_last else None,
+            zero_grad=is_window_start, do_step=is_window_end, loss_scale=1.0 / accum_steps,
         )
         if is_last:
             losses.append(loss_value)
@@ -1628,6 +1696,14 @@ def run_grpo_training_from_rollouts(
             if is_last:
                 msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl_value:.4f}"
             print(msg, flush=True)
+
+    if micro_step_in_window != 0:
+        # rollout_source was exhausted (or the caller's own finite source
+        # ran out) mid accumulation-window - flush whatever gradient was
+        # already accumulated rather than silently discarding it. Every
+        # rank does this identically (accum_steps/step_counter are the
+        # same everywhere), so it can't desync the pipeline.
+        optimizer.step()
 
     elapsed = time.monotonic() - t_start
     print(f"[rank {rank}] GRPO (external rollouts) training DONE in {elapsed:.1f}s ({step_counter} steps)", flush=True)

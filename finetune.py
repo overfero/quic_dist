@@ -84,7 +84,23 @@ class PipelineConfig:
     lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     lora_dropout: float = 0.0
 
-    # Quantization - "4bit" (QLoRA), "8bit", or "none" (plain LoRA)
+    # True: genuine full-parameter fine-tuning - every weight trainable,
+    # no LoRA adapter at all (build_stage_model() skips get_peft_model()
+    # entirely). Requires quantization="none" (there is no such thing as
+    # backprop through a frozen 4bit/8bit base with no adapter to carry
+    # the gradient). The free-reference-model trick every RLHF mode uses
+    # (peft_model.disable_adapter()) has no equivalent without an
+    # adapter - callers that need a KL-to-reference term with
+    # full_finetune=True must bring their own separate frozen reference
+    # model; quic-rl's GRPO integration instead requires kl_coef=0.0 in
+    # that combination (see rlhf.py's _grpo_update_from_rollout, which
+    # skips the reference forward pass entirely when kl_coef==0 - both
+    # a real perf win on its own and what makes full_finetune=True safe
+    # there without ever calling disable_adapter()).
+    full_finetune: bool = False
+
+    # Quantization - "4bit" (QLoRA), "8bit", or "none" (plain LoRA, or
+    # required base for full_finetune=True)
     quantization: str = "4bit"
     bnb_4bit_quant_type: str = "nf4"
     compute_dtype: str = "bfloat16"  # must match the base model's own native dtype - a real
@@ -396,26 +412,39 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
             config.model_path, dtype=config.torch_dtype, attn_implementation=config.attn_implementation,
         ).to(f"cuda:{local_gpu}")
 
-    lora_cfg = LoraConfig(
-        r=config.lora_r, lora_alpha=config.lora_alpha,
-        target_modules=config.lora_target_modules, lora_dropout=config.lora_dropout,
-    )
-    peft_model = get_peft_model(model, lora_cfg)
+    if config.full_finetune:
+        if config.quantization != "none":
+            raise ValueError(
+                f"build_stage_model: full_finetune=True requires quantization='none' "
+                f"(got {config.quantization!r}) - no gradient path exists through a frozen "
+                f"quantized base with no LoRA adapter to carry it."
+            )
+        for p in model.parameters():
+            p.requires_grad_(True)
+        peft_model = model  # not an actual PeftModel here - see full_finetune's own docstring
+        base = model
+    else:
+        lora_cfg = LoraConfig(
+            r=config.lora_r, lora_alpha=config.lora_alpha,
+            target_modules=config.lora_target_modules, lora_dropout=config.lora_dropout,
+        )
+        peft_model = get_peft_model(model, lora_cfg)
+        base = peft_model.base_model.model
 
-    layers = resolve_attr(peft_model.base_model.model, config.layers_attr)
-    embed = resolve_attr(peft_model.base_model.model, config.embed_attr)
-    norm = resolve_attr(peft_model.base_model.model, config.norm_attr)
-    rotary = resolve_attr(peft_model.base_model.model, config.rotary_attr) if config.rotary_attr else None
-    lm_head = resolve_attr(peft_model.base_model.model, config.lm_head_attr)
+    layers = resolve_attr(base, config.layers_attr)
+    embed = resolve_attr(base, config.embed_attr)
+    norm = resolve_attr(base, config.norm_attr)
+    rotary = resolve_attr(base, config.rotary_attr) if config.rotary_attr else None
+    lm_head = resolve_attr(base, config.lm_head_attr)
     my_range = stage_range(rank, config)
     stage_layers = layers[my_range.start : my_range.stop]
 
     n_trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     print(f"[rank {rank}] trainable params: {n_trainable}, layers {list(my_range)}", flush=True)
 
-    hidden_size = getattr(peft_model.base_model.model.config, "hidden_size", None)
+    hidden_size = getattr(base.config, "hidden_size", None)
     if hidden_size is None:
-        hidden_size = peft_model.base_model.model.config.text_config.hidden_size
+        hidden_size = base.config.text_config.hidden_size
     return peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
