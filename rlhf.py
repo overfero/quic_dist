@@ -143,6 +143,31 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
     return local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
+_BEST_CKPT_BROADCAST_TAG = 900_001  # out-of-band vs. the small per-microbatch
+# pipeline tags used elsewhere in this file - see _broadcast_from_last_rank
+
+
+def _broadcast_from_last_rank(value: float, rank: int, world_size: int) -> float:
+    """Real bug found running this for real: `dist.broadcast()` raises
+    `NotImplementedError` against `ProcessGroupQUIC` - that backend only
+    implements point-to-point send/recv/isend/irecv/barrier, a deliberate
+    scope decision (see `process_group.py`'s `_not_implemented`
+    docstring), not a gap this file should route around by pretending
+    the collective exists. Reimplemented here as plain point-to-point
+    sends from the source rank (`world_size - 1`, the only rank that
+    actually knows `reward_mean` - see `_grpo_update_from_rollout`'s own
+    is_last-only return contract) to every other rank."""
+    src = world_size - 1
+    tensor = torch.tensor([value], dtype=torch.float64)
+    if rank == src:
+        for dst in range(world_size):
+            if dst != src:
+                dist.send(tensor, dst=dst, tag=_BEST_CKPT_BROADCAST_TAG)
+    else:
+        dist.recv(tensor, src=src, tag=_BEST_CKPT_BROADCAST_TAG)
+    return tensor.item()
+
+
 def _step_barrier(signaling_url, config, tag: str, job_id: str = "", timeout_s: int = 300):
     """A REAL per-step barrier - unlike `dist.barrier()`, which is only
     safe to call ONCE per process group's lifetime. Found via a real
@@ -1732,11 +1757,12 @@ def run_grpo_training_from_rollouts(
                 # "is this the best checkpoint so far" decision, since
                 # every rank must independently write its own best-copy
                 # (each rank checkpoints its own layer slice/full model).
-                reward_tensor = torch.tensor([reward_mean if is_last else 0.0], dtype=torch.float64)
-                dist.broadcast(reward_tensor, src=config.world_size - 1)
-                is_best = reward_tensor.item() > best_reward_mean
+                broadcast_reward = _broadcast_from_last_rank(
+                    reward_mean if is_last else 0.0, rank, config.world_size
+                )
+                is_best = broadcast_reward > best_reward_mean
                 if is_best:
-                    best_reward_mean = reward_tensor.item()
+                    best_reward_mean = broadcast_reward
 
                 ckpt_path = save_checkpoint(
                     config.checkpoint_dir, rank, peft_model, optimizer,
@@ -1779,11 +1805,12 @@ def run_grpo_training_from_rollouts(
         optimizer.step()
         window_counter += 1
         if config.checkpoint_dir and config.checkpoint_every > 0 and window_counter % config.checkpoint_every == 0:
-            reward_tensor = torch.tensor([reward_mean if is_last else 0.0], dtype=torch.float64)
-            dist.broadcast(reward_tensor, src=config.world_size - 1)
-            is_best = reward_tensor.item() > best_reward_mean
+            broadcast_reward = _broadcast_from_last_rank(
+                reward_mean if is_last else 0.0, rank, config.world_size
+            )
+            is_best = broadcast_reward > best_reward_mean
             if is_best:
-                best_reward_mean = reward_tensor.item()
+                best_reward_mean = broadcast_reward
 
             ckpt_path = save_checkpoint(
                 config.checkpoint_dir, rank, peft_model, optimizer,
