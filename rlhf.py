@@ -1565,7 +1565,7 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
-                    msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl_value:.4f}"
+                    msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={'n/a' if kl_value is None else f'{kl_value:.4f}'}"
                 print(msg, flush=True)
 
         elapsed = time.monotonic() - t_start
@@ -1793,7 +1793,7 @@ def run_grpo_training_from_rollouts(
         if step_counter <= 3 or step_counter % config.log_every == 0:
             msg = f"[rank {rank}] step {step_counter}"
             if is_last:
-                msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={kl_value:.4f}"
+                msg += f" grpo_loss={losses[-1]:.4f} reward_mean={rewards_log[-1]:.3f} kl={'n/a' if kl_value is None else f'{kl_value:.4f}'}"
             print(msg, flush=True)
 
     if micro_step_in_window != 0:

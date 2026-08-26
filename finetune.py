@@ -269,6 +269,23 @@ def resolve_attr(obj, dotted_path: str):
     return obj
 
 
+def set_attr(obj, dotted_path: str, value) -> None:
+    """Companion to resolve_attr() - walks to the PARENT of the dotted
+    path and setattr()s the leaf, so a submodule can be replaced in the
+    live model tree (not just read). Assigning `None` over a previously-
+    registered nn.Module attribute is real, intentional pytorch behavior
+    (nn.Module.__setattr__ special-cases it): the old submodule is
+    dropped from the parent's _modules, and once no other Python
+    reference to it survives, it - and its CUDA-resident parameters -
+    become collectible. See build_stage_model()'s own use of this for
+    why that matters here (freeing layers/embed/lm_head this rank
+    doesn't own)."""
+    parts = dotted_path.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
 def run_decoder_layer(layer, hidden_states, **kwargs):
     """Calls one decoder layer and returns just the hidden-states
     tensor, version-robustly. Some transformers releases' decoder layer
@@ -438,6 +455,57 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
     lm_head = resolve_attr(base, config.lm_head_attr)
     my_range = stage_range(rank, config)
     stage_layers = layers[my_range.start : my_range.stop]
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+
+    if config.quantization == "none" and config.world_size > 1:
+        # Real bug found running this for real (a single-step full_finetune
+        # VRAM test OOM'd on a 15GB T4 even at group_size=8): the quantized/
+        # LoRA branch above already keeps non-owned layers/embed/lm_head OFF
+        # this rank's GPU via build_device_map()'s per-component device_map
+        # (see that function's own docstring) - but that mechanism only
+        # works through bitsandbytes/accelerate's quantized loading path.
+        # This (full_finetune-required) branch loads the WHOLE model then
+        # blindly `.to(f"cuda:{local_gpu}")`s all of it - every rank ended
+        # up holding weights+gradients+optimizer state for ALL
+        # config.num_layers layers PLUS both embed_tokens and lm_head, even
+        # though _forward_stage only ever touches this rank's own
+        # stage_layers, and embed()/norm()/lm_head() are only ever called
+        # by is_first/is_last respectively (see rlhf.py's is_first/is_last-
+        # gated call sites - a middle/non-owning rank never touches them).
+        # Measured: ~13.6GB static (weight+grad+AdamW state) per rank for a
+        # 1.7B model BEFORE this fix, leaving no real headroom for
+        # activations even at a small group_size/response_len.
+        #
+        # Fixed by physically dropping what this rank doesn't own right
+        # after loading, mirroring what build_device_map already does for
+        # the quantized path: only the OWNED decoder layers stay resident
+        # (and trainable); embed_tokens stays only on rank 0; norm+lm_head
+        # stay only on the last rank. `set_attr(base, attr, None)` drops
+        # the old submodule from the live model tree - once this function's
+        # own local variables below are reassigned too, nothing keeps the
+        # freed submodules' CUDA tensors alive.
+        #
+        # IMPORTANT downstream consequence (see grpo_external_rollout_rank.py's
+        # export-merge logic): after this, NO SINGLE RANK holds a complete
+        # model any more - exporting a real checkpoint now genuinely
+        # requires gathering every rank's own shard, not just reading
+        # rank 0's save_pretrained() output (which happened to work before
+        # only because rank 0 held a full, undivided model as a side
+        # effect of this very bug).
+        kept_layers = list(stage_layers)
+        set_attr(base, config.layers_attr, torch.nn.ModuleList(kept_layers))
+        if not is_first:
+            set_attr(base, config.embed_attr, None)
+            embed = None
+        if not is_last:
+            set_attr(base, config.norm_attr, None)
+            set_attr(base, config.lm_head_attr, None)
+            norm = None
+            lm_head = None
+        layers = resolve_attr(base, config.layers_attr)
+        stage_layers = layers
+        torch.cuda.empty_cache()
 
     n_trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     print(f"[rank {rank}] trainable params: {n_trainable}, layers {list(my_range)}", flush=True)
@@ -446,6 +514,62 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
     if hidden_size is None:
         hidden_size = base.config.text_config.hidden_size
     return peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
+
+
+def merge_stage_shards(model_path: str, shard_paths: list[str], config, output_dir: str) -> None:
+    """Reconstructs one complete model from per-rank shards written by
+    the export shard-then-merge protocol (see
+    grpo_external_rollout_rank.py's `_check_export_request`) - needed
+    because build_stage_model()'s own memory fix means NO SINGLE RANK
+    holds a complete model any more when full_finetune=True and
+    world_size>1 (each rank only keeps its own owned layers plus
+    whichever of embed_tokens/norm/lm_head it owns - see that function's
+    own docstring for why). Loads a FRESH model shell on CPU (no GPU -
+    this runs while training ranks' own GPUs are still busy with the
+    next step) purely as a target to receive each shard's state_dict,
+    then saves the reassembled whole. `config` is duck-typed (just needs
+    `layers_attr`/`embed_attr`/`norm_attr`/`lm_head_attr`/`torch_dtype`
+    - the same attributes build_stage_model itself relies on), matching
+    this module's existing convention (see PipelineConfig vs GRPOConfig
+    in rlhf.py)."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=config.torch_dtype)
+    layers = resolve_attr(model, config.layers_attr)
+    embed = resolve_attr(model, config.embed_attr)
+    norm = resolve_attr(model, config.norm_attr)
+    lm_head = resolve_attr(model, config.lm_head_attr)
+
+    # Real bug caught before it corrupted anything: for a model whose
+    # config ties embed_tokens/lm_head (Qwen3's default - see
+    # ARCHITECTURE.md's own weight-tying note), from_pretrained() re-ties
+    # them into the SAME Parameter object. embed's shard comes from rank
+    # 0, lm_head's from the last rank - two DIFFERENT, independently-
+    # trained tensors after a distributed full_finetune run (tying only
+    # ever meant "same object within one process"; splitting them across
+    # ranks broke that the moment build_stage_model() dropped whichever
+    # one each rank doesn't own). Loading one shard's state_dict into a
+    # still-tied pair would in-place overwrite the OTHER one's values
+    # too (load_state_dict copies into the existing tensor, not a fresh
+    # one), silently discarding whichever shard loads first. Explicitly
+    # untying (fresh Parameter, breaks the aliasing) before either shard
+    # is loaded makes both loads land independently, as intended.
+    if lm_head.weight is embed.weight:
+        lm_head.weight = torch.nn.Parameter(lm_head.weight.clone())
+
+    for shard_path in shard_paths:
+        shard = torch.load(shard_path, map_location="cpu", weights_only=False)
+        start = shard["layer_start"]
+        for i, sd in enumerate(shard["layer_state_dicts"]):
+            layers[start + i].load_state_dict(sd)
+        if shard["embed_state_dict"] is not None:
+            embed.load_state_dict(shard["embed_state_dict"])
+        if shard["norm_state_dict"] is not None:
+            norm.load_state_dict(shard["norm_state_dict"])
+        if shard["lm_head_state_dict"] is not None:
+            lm_head.load_state_dict(shard["lm_head_state_dict"])
+
+    model.save_pretrained(output_dir, safe_serialization=True)
 
 
 def build_dataset(tokenizer, config: PipelineConfig) -> tuple[torch.Tensor, torch.Tensor]:
