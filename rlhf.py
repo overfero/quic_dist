@@ -153,18 +153,34 @@ def _broadcast_from_last_rank(value: float, rank: int, world_size: int) -> float
     implements point-to-point send/recv/isend/irecv/barrier, a deliberate
     scope decision (see `process_group.py`'s `_not_implemented`
     docstring), not a gap this file should route around by pretending
-    the collective exists. Reimplemented here as plain point-to-point
-    sends from the source rank (`world_size - 1`, the only rank that
-    actually knows `reward_mean` - see `_grpo_update_from_rollout`'s own
-    is_last-only return contract) to every other rank."""
+    the collective exists.
+
+    SECOND real bug found running this for real, on an actual 2-machine,
+    4-rank deployment (world_size=2 loopback testing never exposed this -
+    there, "every other rank" is exactly one rank, always the pipeline
+    neighbor already connected for forward/backward): the first fix here
+    had the source rank (`world_size - 1`) `dist.send()` DIRECTLY to
+    EVERY other rank, including non-adjacent ones - at world_size=4,
+    rank 3 connecting straight to rank 0 needs a brand-new QUIC
+    connection between two ranks that never otherwise talk (only
+    adjacent ranks exchange pipeline activations/gradients). Confirmed
+    directly via `QUIC_DIST_FAULTHANDLER`'s stack dump: rank 0 sat
+    blocked inside `_connect_to_peer` -> `_get_or_connect`, hole-punching
+    a connection to rank 3 that never completed, while the SAME rank's
+    adjacent link (rank 0 <-> rank 1) had already hole-punched
+    successfully. Fixed by relaying the value down the SAME
+    already-established adjacent-rank chain the pipeline itself uses
+    (world_size-1 -> world_size-2 -> ... -> 0) instead of the source
+    connecting to everyone directly - reuses connections already proven
+    to work, and the number of hops equals the number of ranks either
+    way, so this isn't slower in any case that matters (the checkpoint
+    save it gates is already the dominant cost)."""
     src = world_size - 1
     tensor = torch.tensor([value], dtype=torch.float64)
-    if rank == src:
-        for dst in range(world_size):
-            if dst != src:
-                dist.send(tensor, dst=dst, tag=_BEST_CKPT_BROADCAST_TAG)
-    else:
-        dist.recv(tensor, src=src, tag=_BEST_CKPT_BROADCAST_TAG)
+    if rank != src:
+        dist.recv(tensor, src=rank + 1, tag=_BEST_CKPT_BROADCAST_TAG)
+    if rank > 0:
+        dist.send(tensor, dst=rank - 1, tag=_BEST_CKPT_BROADCAST_TAG)
     return tensor.item()
 
 
