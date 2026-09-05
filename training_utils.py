@@ -42,7 +42,7 @@ def _tpu_chip_count() -> int:
     return n
 
 
-def resolve_device(rank: int, local_index: int | None = None) -> torch.device:
+def resolve_device(rank: int, local_index: int | None = None, tensor_parallel_size: int = 1) -> torch.device:
     """Picks this rank's real accelerator device: TPU > CUDA > CPU,
     mirroring the old hardcoded `torch.device(f"cuda:{rank %
     torch.cuda.device_count()}")` pattern every *_pipeline_rank.py
@@ -55,20 +55,81 @@ def resolve_device(rank: int, local_index: int | None = None) -> torch.device:
     two-process test that the PJRT TPU runtime is exclusive per host by
     default - a second process's own device init hits a real `Device or
     resource busy` on /dev/vfio and aborts. TPU_VISIBLE_CHIPS (which
-    physical chip this process may see) plus TPU_CHIPS_PER_PROCESS_BOUNDS/
-    TPU_PROCESS_BOUNDS=1,1,1 (this process owns exactly one chip) fixes
-    that - confirmed via the same test running both processes
-    concurrently without conflict once these were set. Set via
+    physical chip(s) this process may see) plus TPU_CHIPS_PER_PROCESS_BOUNDS/
+    TPU_PROCESS_BOUNDS (this process owns exactly its own chips, no
+    others) fixes that - confirmed via the same test running both
+    processes concurrently without conflict once these were set. Set via
     `os.environ.setdefault` (not unconditional) so a caller that already
     exports these itself - e.g. a real multi-host TPU pod launcher -
     isn't overridden. Must happen before `torch_xla` first touches the
     runtime, which is why this function imports it lazily rather than at
     module scope.
 
+    tensor_parallel_size > 1: this rank now needs a CONTIGUOUS BLOCK of
+    that many chips (not just one) - real intra-stage tensor parallelism
+    via torch_xla SPMD (see tensor_parallel.py) shards weights across
+    every chip a single quic_dist rank owns, so those chips must all be
+    visible to (and only to) this one process, exactly like the
+    single-chip case above just with a wider block. Enables SPMD mode
+    (`xr.use_spmd()`) globally for this process - do not mix a
+    tensor_parallel_size>1 rank with plain (non-SPMD) tensor ops in the
+    same process afterward. rank=0's block is chips [0, tp_size); rank=1's
+    is [tp_size, 2*tp_size); etc. - matches PipelineConfig.world_size *
+    tensor_parallel_size <= total host chips (checked here, not silently
+    truncated - an oversubscribed block is a real config error, not
+    something to paper over by wrapping/reusing chips another rank
+    already owns). The whole-host case (world_size==1,
+    tensor_parallel_size==total chip count - this project's only
+    LIVE-VALIDATED TP shape so far) skips TPU_VISIBLE_CHIPS/*_BOUNDS
+    entirely rather than setting an arbitrary "{tp_size},1,1" - see the
+    real crash this works around in the code below. A STRICT-SUBSET
+    block (world_size>1 combined with tensor_parallel_size>1, i.e. PP+TP
+    together) still uses that same "{tp_size},1,1" factorization, which
+    is only a VALID decomposition of the host's real physical topology
+    (TPU_CHIPS_PER_HOST_BOUNDS) for some tensor_parallel_size values, not
+    all - that combined path is UNTESTED, unlike the whole-host case.
+
     CUDA: unchanged behavior - `cuda:{local_index}`.
 
     CPU: last resort, e.g. local dev/test without an accelerator."""
     if os.environ.get("PJRT_DEVICE", "").upper() == "TPU":
+        if tensor_parallel_size > 1:
+            chip_count = _tpu_chip_count()
+            start = (local_index if local_index is not None else rank) * tensor_parallel_size
+            if start + tensor_parallel_size > chip_count:
+                raise ValueError(
+                    f"resolve_device: rank {rank} needs chips [{start}, {start + tensor_parallel_size}) "
+                    f"but only {chip_count} are available on this host - world_size * "
+                    f"tensor_parallel_size must fit within the host's total TPU chip count."
+                )
+            # Only restrict TPU_VISIBLE_CHIPS/*_BOUNDS when this rank owns a
+            # STRICT SUBSET of the host's chips (world_size>1, combined
+            # PP+TP). A real crash found running this for real: when this
+            # rank claims the WHOLE host (the common tensor_parallel_size ==
+            # chip_count, world_size==1 case), an arbitrary bounds
+            # factorization like "8,1,1" does NOT validly decompose the
+            # REAL physical topology (TPU_CHIPS_PER_HOST_BOUNDS, e.g.
+            # "2,4,1" on a v5e-8 - dimension 0 there physically holds only 2
+            # chips, not 8) - libtpu fatal-exits (silent `exit(1)`, no
+            # Python traceback - not even a catchable exception) the moment
+            # anything queries the real device topology (confirmed via a
+            # direct isolated repro: xm.xla_device() itself succeeds
+            # lazily, but xr.addressable_runtime_device_count() - which
+            # forces real topology negotiation - is what actually crashes).
+            # Skipping the restriction entirely for the whole-host case
+            # sidesteps this completely: the default (no TPU_VISIBLE_CHIPS)
+            # behavior already gives full, correctly-bounded visibility.
+            if start != 0 or tensor_parallel_size != chip_count:
+                chips = ",".join(str(c) for c in range(start, start + tensor_parallel_size))
+                os.environ.setdefault("TPU_VISIBLE_CHIPS", chips)
+                os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", f"{tensor_parallel_size},1,1")
+                os.environ.setdefault("TPU_PROCESS_BOUNDS", "1,1,1")
+            import torch_xla.runtime as xr
+
+            xr.use_spmd()
+            import torch_xla.core.xla_model as xm
+
+            return xm.xla_device()
         if local_index is None:
             local_index = rank % _tpu_chip_count()
         os.environ.setdefault("TPU_VISIBLE_CHIPS", str(local_index))

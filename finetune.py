@@ -99,6 +99,31 @@ class PipelineConfig:
     # there without ever calling disable_adapter()).
     full_finetune: bool = False
 
+    # Real intra-stage TENSOR parallelism (TP), layered UNDER this
+    # module's existing PIPELINE parallelism (PP) - the two are
+    # different axes and combine multiplicatively: each of this run's
+    # `world_size` quic_dist PP ranks now owns a contiguous BLOCK of
+    # `tensor_parallel_size` TPU chips (instead of one), and shards ITS
+    # OWN layers' attention/MLP Linear weights across that block via
+    # torch_xla SPMD (see tensor_parallel.py's module docstring for why
+    # this works despite ProcessGroupQUIC having no collective ops at
+    # all - TP's collectives never touch quic_dist's transport, they're
+    # entirely inside the XLA-compiled graph, between chips of ONE
+    # rank's own block). 1 (default) = unchanged existing behavior, no
+    # SPMD involved. TPU/XLA only for now - build_stage_model raises if
+    # this is >1 on a non-XLA device. Requires
+    # `world_size * tensor_parallel_size <= <host's total TPU chip
+    # count>` - training_utils.resolve_device() raises a clear error
+    # otherwise rather than silently wrapping/reusing chips another rank
+    # already owns. Works with plain LoRA (quantization="none") AND
+    # full_finetune=True - tensor_parallel.py's _real_linear() reaches
+    # through peft's LoRA wrapper to the frozen base_layer either way.
+    # NOT yet combined with quantization="4bit"/"8bit" (bitsandbytes is
+    # CUDA-only regardless, see quantization's own field comment) or
+    # with a sharded vocab (embed_tokens/lm_head stay replicated - see
+    # tensor_parallel.py's docstring for the real scope cut this is).
+    tensor_parallel_size: int = 1
+
     # Quantization - "4bit" (QLoRA), "8bit", or "none" (plain LoRA, or
     # required base for full_finetune=True)
     quantization: str = "4bit"
@@ -397,6 +422,11 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig, device:
             f"build_stage_model: quantization={config.quantization!r} requires a CUDA device "
             f"(bitsandbytes has no TPU/XLA support) - got {device}. Use quantization='none' "
             f"(plain LoRA or full_finetune) on TPU."
+        )
+    if config.tensor_parallel_size > 1 and device.type != "xla":
+        raise ValueError(
+            f"build_stage_model: tensor_parallel_size={config.tensor_parallel_size} requires an "
+            f"XLA/TPU device (see tensor_parallel.py) - got {device}."
         )
     if config.patch_torchao_check:
         import peft.tuners.lora.torchao as torchao_mod
@@ -802,7 +832,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
 
     set_seed(config.seed)
 
-    device = resolve_device(rank, local_gpu)
+    device = resolve_device(rank, local_gpu, tensor_parallel_size=config.tensor_parallel_size)
     local_gpu = device.index if device.type == "cuda" else 0
     is_first = rank == 0
     is_last = rank == config.world_size - 1
@@ -825,6 +855,21 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
 
     peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config, device=device)
+    if config.tensor_parallel_size > 1:
+        from quic_dist.tensor_parallel import build_tp_mesh, shard_linear_layers
+
+        tp_mesh = build_tp_mesh(config.tensor_parallel_size)
+        n_sharded = shard_linear_layers(stage_layers, tp_mesh)
+        print(f"[rank {rank}] tensor-parallel sharded {n_sharded} Linear layers across "
+              f"{config.tensor_parallel_size} chips", flush=True)
+        if n_sharded == 0:
+            raise RuntimeError(
+                f"[rank {rank}] tensor_parallel_size={config.tensor_parallel_size} but 0 Linear "
+                f"layers matched the column/row-parallel naming convention - this model's "
+                f"attention/MLP submodule names don't match tensor_parallel.py's assumptions "
+                f"(q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj); check its real "
+                f"submodule names before relying on TP for it."
+            )
     if config.gradient_checkpointing:
         peft_model.enable_input_require_grads()
 
