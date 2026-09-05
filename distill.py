@@ -437,6 +437,7 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
                 loss = config.alpha_hard * hard_loss + config.alpha_soft * soft_loss + config.alpha_hidden * hidden_loss
                 loss.backward()
                 optimizer.step()
+                mark_step(device)
                 losses.append(loss.item())
 
                 if config.checkpoint_dir and config.checkpoint_every > 0 and step_counter % config.checkpoint_every == 0:

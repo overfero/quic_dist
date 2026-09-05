@@ -571,6 +571,7 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
                 dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
 
             optimizer.step()
+            mark_step(device)
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
@@ -588,7 +589,7 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
                 print(f"[rank {rank}] checkpoint saved: {path}", flush=True)
 
         elapsed = time.monotonic() - t_start
-        if is_last:
+        if is_last and losses:
             print(f"[rank {rank}] epoch {epoch}/{config.epochs} loss={losses[-1]:.4f} elapsed={elapsed:.1f}s", flush=True)
         else:
             print(f"[rank {rank}] epoch {epoch}/{config.epochs} elapsed={elapsed:.1f}s", flush=True)

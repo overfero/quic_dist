@@ -1,0 +1,31 @@
+# TPU test of multimodal.py's new non-CUDA branch in
+# build_multimodal_stage_model - accelerate's device_map= dispatch
+# (used unconditionally before this fix, even at quantization="none")
+# only understands CUDA indices/"cpu"/"disk", never worked on TPU/XLA.
+# Same model/topology as llava_qwen05b_multimodal.yaml (already real,
+# validated on GPU with this exact quantization="none" setting) - 2-stage
+# pipeline, no TP (world_size: 2, no tensor_parallel_size) to isolate
+# testing the NEW CPU-load + manual-placement code path itself first.
+#
+# Run: python3 multimodal_pipeline_rank.py configs/tpu_llava_qwen05b_multimodal.yaml <rank> <signaling_url>
+
+model_path: llava-hf/llava-interleave-qwen-0.5b-hf
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"
+compute_dtype: bfloat16
+connect_timeout_s: 900
+
+dataset_name: HuggingFaceH4/llava-instruct-mix-vsft
+dataset_split: train
+num_examples: 8
+max_len: 1024
+
+epochs: 2
+lr: 0.0001
+log_every: 1

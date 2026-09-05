@@ -1,0 +1,39 @@
+# TPU test of distill.py's quantization="none" path (already
+# device-agnostic before this session - `.to(device)`, no device_map -
+# just needed the CUDA-only guard added for quantization!="none" and
+# the resolve_device()/tensor_parallel_size wiring). Uses the SAME
+# small model as both teacher and student (not the real 7B->0.5B proof
+# in qwen_7b_to_0.5b_distill.yaml) purely to keep this a cheap,
+# fast TPU-compute-path smoke test - the point is proving rank 0's
+# frozen-teacher forward and rank 1's trainable-student forward+backward
+# both run correctly on TPU, not a real distillation result.
+#
+# Run: python3 distill_pipeline_rank.py configs/tpu_qwen25_0.5b_distill.yaml <rank> <signaling_url>
+
+teacher_model_path: Qwen/Qwen2.5-0.5B
+student_model_path: Qwen/Qwen2.5-0.5B
+
+teacher_quantization: "none"
+student_quantization: "none"
+compute_dtype: bfloat16
+
+student_lora_r: 8
+student_lora_alpha: 16
+student_lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+temperature: 2.0
+alpha_hard: 0.3
+alpha_soft: 0.5
+alpha_hidden: 0.2
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 8
+text_field: text
+
+seq_len: 64
+batch: 1
+epochs: 2
+lr: 0.0001
+log_every: 1
+connect_timeout_s: 900
