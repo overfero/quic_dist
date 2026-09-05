@@ -1,0 +1,31 @@
+# TPU 8-way test: all 8 v5e-8 chips, one pipeline stage per chip (3 of
+# Qwen2.5-0.5B's 24 decoder layers each) - exercises resolve_device()'s
+# per-rank TPU_VISIBLE_CHIPS isolation across every chip on the host at
+# once, not just the 2-chip smoke test. Same quantization="none" +
+# bfloat16 requirement as the 2-way config (bitsandbytes is CUDA-only).
+#
+# Run: one process per rank (0..7), each:
+#   python3 pipeline_finetune_rank.py configs/tpu_qwen25_0.5b_lora_8way.yaml <rank> <signaling_url> <job_id>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 8
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"
+compute_dtype: bfloat16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 16
+text_field: text
+
+seq_len: 64
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 1
+connect_timeout_s: 300
