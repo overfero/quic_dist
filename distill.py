@@ -64,6 +64,7 @@ import quic_dist
 import torch.distributed as dist
 
 from quic_dist.rlhf import _step_barrier, _teardown
+from quic_dist.finetune import resolve_attr
 
 
 @dataclass
@@ -76,6 +77,26 @@ class DistillConfig:
     bnb_4bit_quant_type: str = "nf4"
     compute_dtype: str = "bfloat16"
     patch_torchao_check: bool = True
+
+    # Dotted attribute path to the decoder layers, resolved via
+    # finetune.resolve_attr() - only used when tensor_parallel_size > 1,
+    # to find the Linear submodules to shard (see tensor_parallel.py).
+    # Default matches a plain AutoModelForCausalLM, same as
+    # finetune.PipelineConfig.layers_attr's identical field/default.
+    layers_attr: str = "model.layers"
+
+    # Real intra-stage tensor parallelism via torch_xla SPMD - see
+    # finetune.PipelineConfig.tensor_parallel_size's field comment for
+    # the full rationale. Unlike finetune.py's stage-split pipeline,
+    # this module is NOT pipeline-parallel (each rank holds one WHOLE
+    # model - teacher on rank 0, student on rank 1, see this module's
+    # own docstring) - tensor_parallel_size shards THAT WHOLE model's
+    # decoder layers across this rank's own chip block. Requires
+    # quantization="none" for whichever of teacher_quantization/
+    # student_quantization applies to this rank (bitsandbytes is
+    # CUDA-only, same requirement as finetune.py's identical field).
+    # 1 (default) = unchanged behavior.
+    tensor_parallel_size: int = 1
 
     student_lora_r: int = 8
     student_lora_alpha: int = 16
@@ -170,6 +191,11 @@ def _load_full_model(model_path: str, quantization: str, config: DistillConfig, 
     hflog.disable_progress_bar()
     hflog.set_verbosity_error()
 
+    if quantization != "none" and device.type != "cuda":
+        raise ValueError(
+            f"_load_full_model: quantization={quantization!r} requires a CUDA device "
+            f"(bitsandbytes has no TPU/XLA support) - got {device}. Use quantization='none' on TPU."
+        )
     if quantization == "4bit":
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype=config.torch_dtype, bnb_4bit_quant_type=config.bnb_4bit_quant_type,
@@ -223,7 +249,7 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
     set_seed(config.seed)
 
     is_teacher = rank == 0
-    device = resolve_device(rank)
+    device = resolve_device(rank, tensor_parallel_size=config.tensor_parallel_size)
     local_gpu = device.index if device.type == "cuda" else 0
 
     logger = ExperimentLogger(config.log_path, rank)
@@ -241,12 +267,29 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
     )
     print(f"[rank {rank}] process group ready ({'teacher' if is_teacher else 'student'}, local GPU {local_gpu})", flush=True)
 
+    def _apply_tp(model, label: str) -> None:
+        if config.tensor_parallel_size <= 1:
+            return
+        from quic_dist.tensor_parallel import build_tp_mesh, shard_linear_layers
+
+        layers = resolve_attr(model, config.layers_attr)
+        tp_mesh = build_tp_mesh(config.tensor_parallel_size)
+        n_sharded = shard_linear_layers(layers, tp_mesh)
+        print(f"[rank {rank}] tensor-parallel sharded {n_sharded} Linear layers of the {label} "
+              f"across {config.tensor_parallel_size} chips", flush=True)
+        if n_sharded == 0:
+            raise RuntimeError(
+                f"[rank {rank}] tensor_parallel_size={config.tensor_parallel_size} but 0 Linear "
+                f"layers matched the column/row-parallel naming convention - see tensor_parallel.py."
+            )
+
     if is_teacher:
         teacher, teacher_hidden = _load_full_model(
             config.teacher_model_path, config.teacher_quantization, config, device,
             attn_implementation=config.teacher_attn_implementation,
         )
         teacher.eval()
+        _apply_tp(teacher, "teacher")
         teacher_vocab = teacher.config.vocab_size
         print(f"[rank {rank}] teacher loaded, hidden_size={teacher_hidden}, vocab_size={teacher_vocab}", flush=True)
         trainable = []
@@ -261,6 +304,7 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
             config.student_model_path, config.student_quantization, config, device, lora_cfg=lora_cfg,
             attn_implementation=config.student_attn_implementation,
         )
+        _apply_tp(student, "student")
         student_vocab = student.config.vocab_size
         n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
         print(f"[rank {rank}] student loaded, hidden_size={student_hidden}, vocab_size={student_vocab}, "

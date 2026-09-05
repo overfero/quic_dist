@@ -49,6 +49,8 @@ import torch.nn.functional as F
 import quic_dist
 import torch.distributed as dist
 
+from quic_dist.training_utils import mark_step
+
 from quic_dist.finetune import resolve_attr, stage_range, build_device_map, build_stage_model, run_decoder_layer
 
 
@@ -87,6 +89,15 @@ class RLHFModelConfig:
     compute_dtype: str = "bfloat16"
     cpu_offload_unused_layers: bool = False
     patch_torchao_check: bool = True
+
+    # Same field/default/semantics as finetune.PipelineConfig's identical
+    # field (see there for the full rationale, and tensor_parallel.py's
+    # module docstring for the mechanism) - real intra-stage tensor
+    # parallelism via torch_xla SPMD, layered under this run's existing
+    # quic_dist pipeline parallelism. 1 (default) = unchanged behavior.
+    # _init_rank below is the single choke point every RLHF mode
+    # (DPO/GRPO/PPO/RM/PRM) shares, so this one field covers all of them.
+    tensor_parallel_size: int = 1
 
     # Same field/default as finetune.PipelineConfig's identical field -
     # required here too (not just documentation) since build_stage_model()
@@ -134,7 +145,8 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
               # failure mode here so it's not re-discovered per mode.
     from quic_dist.training_utils import resolve_device
 
-    device = resolve_device(rank)
+    tp_size = getattr(config, "tensor_parallel_size", 1)
+    device = resolve_device(rank, tensor_parallel_size=tp_size)
     local_gpu = device.index if device.type == "cuda" else 0
     quic_dist.init_process_group(
         signaling_url=signaling_url, rank=rank, world_size=config.world_size, job_id=job_id,
@@ -142,6 +154,17 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
     )
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
     peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config, device=device)
+    if tp_size > 1:
+        from quic_dist.tensor_parallel import build_tp_mesh, shard_linear_layers
+
+        tp_mesh = build_tp_mesh(tp_size)
+        n_sharded = shard_linear_layers(stage_layers, tp_mesh)
+        print(f"[rank {rank}] tensor-parallel sharded {n_sharded} Linear layers across {tp_size} chips", flush=True)
+        if n_sharded == 0:
+            raise RuntimeError(
+                f"[rank {rank}] tensor_parallel_size={tp_size} but 0 Linear layers matched the "
+                f"column/row-parallel naming convention - see tensor_parallel.py."
+            )
     return local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
@@ -480,6 +503,7 @@ def run_dpo_training(rank: int, signaling_url: str, config: DPOConfig, job_id: s
                 dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
 
             optimizer.step()
+            mark_step(device)
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
@@ -688,6 +712,7 @@ def run_rm_training(rank: int, signaling_url: str, config: RMConfig, job_id: str
                 dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
 
             optimizer.step()
+            mark_step(device)
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
@@ -912,6 +937,7 @@ def run_prm_training(rank: int, signaling_url: str, config: PRMConfig, job_id: s
                 dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
 
             optimizer.step()
+            mark_step(device)
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
@@ -1469,6 +1495,7 @@ def _grpo_update_from_rollout(
 
     if do_step:
         optimizer.step()
+        mark_step(device)
     return loss_value, (reward_mean if is_last else None), kl_value
 
 
@@ -1828,6 +1855,7 @@ def run_grpo_training_from_rollouts(
         # rank does this identically (accum_steps/step_counter are the
         # same everywhere), so it can't desync the pipeline.
         optimizer.step()
+        mark_step(device)
         window_counter += 1
         if config.checkpoint_dir and config.checkpoint_every > 0 and window_counter % config.checkpoint_every == 0:
             broadcast_reward = _broadcast_from_last_rank(
@@ -2085,6 +2113,7 @@ def run_rloo_training(rank: int, signaling_url: str, config: RLOOConfig, job_id:
                 dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
 
             optimizer.step()
+            mark_step(device)
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:
@@ -2352,6 +2381,7 @@ def run_ppo_training(rank: int, signaling_url: str, config: PPOConfig, job_id: s
                     dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_epoch)
 
                 optimizer.step()
+                mark_step(device)
 
             if is_last:
                 losses.append(last_loss)

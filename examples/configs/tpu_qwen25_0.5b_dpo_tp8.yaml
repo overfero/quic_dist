@@ -1,0 +1,35 @@
+# TPU tensor-parallel test for rlhf.py's DPO mode: single quic_dist
+# rank (world_size: 1, no pipeline parallelism), sharded across all 8
+# v5e-8 chips via torch_xla SPMD (tensor_parallel_size: 8). Validates
+# the SAME _init_rank() choke point every RLHF mode (DPO/GRPO/PPO/RM/
+# PRM) shares - see rlhf.RLHFModelConfig.tensor_parallel_size's field
+# comment.
+#
+# Run: python3 dpo_pipeline_rank.py configs/tpu_qwen25_0.5b_dpo_tp8.yaml 0 http://localhost:8000
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 1
+num_layers: 24
+tensor_parallel_size: 8
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"
+compute_dtype: bfloat16
+
+beta: 0.1
+dataset_name: Intel/orca_dpo_pairs
+dataset_split: train
+num_examples: 16
+prompt_field: question
+chosen_field: chosen
+rejected_field: rejected
+
+max_prompt_len: 64
+max_response_len: 64
+batch: 2
+epochs: 2
+lr: 0.0001
+log_every: 1

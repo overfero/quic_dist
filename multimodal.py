@@ -65,7 +65,7 @@ import torch.nn.functional as F
 import quic_dist
 import torch.distributed as dist
 
-from quic_dist.finetune import resolve_attr, stage_range, build_device_map, run_decoder_layer
+from quic_dist.finetune import resolve_attr, set_attr, stage_range, build_device_map, run_decoder_layer
 from quic_dist.rlhf import _step_barrier, _teardown
 
 
@@ -109,6 +109,16 @@ class MultimodalConfig:
     compute_dtype: str = "bfloat16"
     cpu_offload_unused_layers: bool = False
     patch_torchao_check: bool = True
+
+    # Real intra-stage tensor parallelism via torch_xla SPMD - see
+    # finetune.PipelineConfig.tensor_parallel_size's field comment for
+    # the full rationale. Requires quantization="none" (already this
+    # module's own default/only-validated setting) and a TPU/XLA device
+    # - see build_multimodal_stage_model's non-CUDA branch. Shards the
+    # decoder layers' attention/MLP Linear weights only, same scope cut
+    # as everywhere else in tensor_parallel.py - the vision tower stays
+    # replicated. 1 (default) = unchanged behavior.
+    tensor_parallel_size: int = 1
 
     connect_timeout_s: int = 300
     log_every: int = 4
@@ -183,11 +193,41 @@ def build_multimodal_device_map(rank: int, local_gpu: int, config: MultimodalCon
     return device_map
 
 
-def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalConfig):
+def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalConfig, device: "torch.device | None" = None):
     """Returns (peft_model, stage_layers, embed_tokens, norm,
     rotary_emb_or_None, lm_head, hidden_size, vision_tower_or_None,
     get_image_features_fn_or_None) - the last two are only non-None on
-    rank 0 (is_first), matching where they're actually placed and used."""
+    rank 0 (is_first), matching where they're actually placed and used.
+
+    `device` defaults to `cuda:{local_gpu}` (unchanged behavior) when
+    omitted. Quantization ("4bit"/"8bit") is CUDA-only (bitsandbytes),
+    rejected up front on any other device - same as finetune.py's
+    build_stage_model. The quantization="none" path additionally
+    branches on device.type: CUDA keeps the original accelerate
+    `device_map=` dispatch (unchanged, still needed for real multi-GPU
+    layer placement); any other device (TPU/XLA) does NOT use
+    device_map at all - accelerate's device_map dispatch only
+    understands CUDA device indices/"cpu"/"disk", not an XLA device
+    object - loading the WHOLE model on CPU first, then moving only
+    this rank's OWNED pieces (its stage_layers, embed_tokens if
+    is_first, norm/lm_head/vision_tower/projector if applicable) onto
+    `device` and physically dropping everything else via `set_attr(...,
+    None)`, mirroring finetune.build_stage_model's identical
+    world_size>1/quantization="none" fix (see that function's own
+    docstring for the real per-rank full-model-duplication bug this
+    same pattern fixes)."""
+    if device is None:
+        device = torch.device(f"cuda:{local_gpu}")
+    if config.quantization != "none" and device.type != "cuda":
+        raise ValueError(
+            f"build_multimodal_stage_model: quantization={config.quantization!r} requires a CUDA "
+            f"device (bitsandbytes has no TPU/XLA support) - got {device}. Use quantization='none' on TPU."
+        )
+    if config.tensor_parallel_size > 1 and device.type != "xla":
+        raise ValueError(
+            f"build_multimodal_stage_model: tensor_parallel_size={config.tensor_parallel_size} "
+            f"requires an XLA/TPU device (see tensor_parallel.py) - got {device}."
+        )
     if config.patch_torchao_check:
         import peft.tuners.lora.torchao as torchao_mod
 
@@ -200,8 +240,11 @@ def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalCo
     hflog.disable_progress_bar()
     hflog.set_verbosity_error()
 
-    device_map = build_multimodal_device_map(rank, local_gpu, config)
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+
     if config.quantization == "4bit":
+        device_map = build_multimodal_device_map(rank, local_gpu, config)
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=config.torch_dtype,
@@ -212,11 +255,12 @@ def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalCo
             config.model_path, quantization_config=bnb_cfg, device_map=device_map, attn_implementation=config.attn_implementation,
         )
     elif config.quantization == "8bit":
+        device_map = build_multimodal_device_map(rank, local_gpu, config)
         bnb_cfg = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=config.cpu_offload_unused_layers)
         model = AutoModelForImageTextToText.from_pretrained(
             config.model_path, quantization_config=bnb_cfg, device_map=device_map, attn_implementation=config.attn_implementation,
         )
-    else:
+    elif device.type == "cuda":
         # `dtype=` (the newer kwarg name) errors here specifically -
         # `LlavaForConditionalGeneration.__init__() got an unexpected
         # keyword argument 'dtype'` - a real, direct crash confirmed via
@@ -227,8 +271,15 @@ def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalCo
         # device_map= in the same call - some code path specific to
         # device_map+multimodal model classes here doesn't accept the
         # newer kwarg name.
+        device_map = build_multimodal_device_map(rank, local_gpu, config)
         model = AutoModelForImageTextToText.from_pretrained(
             config.model_path, torch_dtype=config.torch_dtype, device_map=device_map, attn_implementation=config.attn_implementation,
+        )
+    else:
+        # Non-CUDA (TPU/XLA): no device_map - see this function's own
+        # docstring. Load the whole model on CPU, no placement yet.
+        model = AutoModelForImageTextToText.from_pretrained(
+            config.model_path, torch_dtype=config.torch_dtype, attn_implementation=config.attn_implementation,
         )
 
     lora_cfg = LoraConfig(
@@ -243,18 +294,63 @@ def build_multimodal_stage_model(rank: int, local_gpu: int, config: MultimodalCo
     norm = resolve_attr(base, config.norm_attr)
     rotary = resolve_attr(base, config.rotary_attr) if config.rotary_attr else None
     lm_head = resolve_attr(base, config.lm_head_attr)
+    vision_tower = resolve_attr(base, config.vision_tower_attr)
+    projector = resolve_attr(base, config.projector_attr)
     my_range = stage_range(rank, config)
     stage_layers = layers[my_range.start: my_range.stop]
 
-    is_first = rank == 0
-    vision_tower = None
+    if config.quantization == "none" and device.type != "cuda":
+        # Physically move only what THIS rank owns, and drop everything
+        # else - see this function's own docstring for why (accelerate's
+        # device_map can't do this placement for us on a non-CUDA
+        # device, unlike the CUDA branches above).
+        for layer in stage_layers:
+            layer.to(device)
+        set_attr(base, config.layers_attr, torch.nn.ModuleList(list(stage_layers)))
+        if is_first:
+            embed.to(device)
+            vision_tower.to(device)
+            projector.to(device)
+        else:
+            set_attr(base, config.embed_attr, None)
+            set_attr(base, config.vision_tower_attr, None)
+            set_attr(base, config.projector_attr, None)
+            embed = None
+            vision_tower = None
+        if is_last:
+            norm.to(device)
+            lm_head.to(device)
+        else:
+            set_attr(base, config.norm_attr, None)
+            set_attr(base, config.lm_head_attr, None)
+            norm = None
+            lm_head = None
+        if rotary is not None:
+            rotary.to(device)
+        layers = resolve_attr(base, config.layers_attr)
+        stage_layers = layers
+
     get_image_features = None
     if is_first:
-        vision_tower = resolve_attr(base, config.vision_tower_attr)
         # base.model is the raw LlavaModel - get_image_features is ITS
         # method (runs vision_tower + projector together), not
         # reimplemented here. Bound so callers don't need `base` at all.
         get_image_features = base.model.get_image_features
+    else:
+        vision_tower = None
+
+    if config.tensor_parallel_size > 1:
+        from quic_dist.tensor_parallel import build_tp_mesh, shard_linear_layers
+
+        tp_mesh = build_tp_mesh(config.tensor_parallel_size)
+        n_sharded = shard_linear_layers(stage_layers, tp_mesh)
+        print(f"[rank {rank}] tensor-parallel sharded {n_sharded} Linear layers across "
+              f"{config.tensor_parallel_size} chips", flush=True)
+        if n_sharded == 0:
+            raise RuntimeError(
+                f"[rank {rank}] tensor_parallel_size={config.tensor_parallel_size} but 0 Linear "
+                f"layers matched the column/row-parallel naming convention - see tensor_parallel.py."
+            )
 
     n_trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     print(f"[rank {rank}] trainable params: {n_trainable}, layers {list(my_range)}", flush=True)
@@ -355,7 +451,7 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
     logger = ExperimentLogger(config.log_path, rank)
     logger.log_config(config)
 
-    device = resolve_device(rank)
+    device = resolve_device(rank, tensor_parallel_size=config.tensor_parallel_size)
     local_gpu = device.index if device.type == "cuda" else 0
     is_first = rank == 0
     is_last = rank == config.world_size - 1
@@ -369,7 +465,7 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
 
     (peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size,
-     vision_tower, get_image_features) = build_multimodal_stage_model(rank, local_gpu, config)
+     vision_tower, get_image_features) = build_multimodal_stage_model(rank, local_gpu, config, device=device)
 
     dist.barrier()
     print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)

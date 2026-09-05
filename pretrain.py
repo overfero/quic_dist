@@ -127,6 +127,16 @@ class PretrainConfig:
     # transformers version.
     attn_implementation: str = "sdpa"
 
+    # Real intra-stage tensor parallelism via torch_xla SPMD, layered
+    # under this run's existing quic_dist pipeline parallelism - same
+    # field/semantics as finetune.PipelineConfig.tensor_parallel_size
+    # (see there, and tensor_parallel.py's module docstring, for the
+    # full rationale). 1 (default) = unchanged behavior. Pretraining has
+    # no LoRA/quantization to interact with (see this module's own
+    # docstring) - build_pretrain_stage_model's decoder layers are plain
+    # nn.Linear throughout, the simplest case tensor_parallel.py handles.
+    tensor_parallel_size: int = 1
+
     # Checkpoint save/resume - every rank has real trainable params here
     # (unlike distill.py's frozen-teacher split), so this applies
     # uniformly, same contract as finetune.py's identical fields.
@@ -283,7 +293,7 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
 
     set_seed(config.seed)
 
-    device = resolve_device(rank)
+    device = resolve_device(rank, tensor_parallel_size=config.tensor_parallel_size)
     local_gpu = device.index if device.type == "cuda" else 0
     is_first = rank == 0
     is_last = rank == config.world_size - 1
@@ -302,6 +312,18 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
     model, stage_layers, embed, norm, rotary, lm_head, hidden_size, trainable, tokenizer = build_pretrain_stage_model(
         rank, local_gpu, config, device=device
     )
+    if config.tensor_parallel_size > 1:
+        from quic_dist.tensor_parallel import build_tp_mesh, shard_linear_layers
+
+        tp_mesh = build_tp_mesh(config.tensor_parallel_size)
+        n_sharded = shard_linear_layers(stage_layers, tp_mesh)
+        print(f"[rank {rank}] tensor-parallel sharded {n_sharded} Linear layers across "
+              f"{config.tensor_parallel_size} chips", flush=True)
+        if n_sharded == 0:
+            raise RuntimeError(
+                f"[rank {rank}] tensor_parallel_size={config.tensor_parallel_size} but 0 Linear "
+                f"layers matched the column/row-parallel naming convention - see tensor_parallel.py."
+            )
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
     batches = build_pretrain_dataset(tokenizer, config)
