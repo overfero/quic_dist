@@ -153,7 +153,7 @@ class PretrainConfig:
         return getattr(torch, self.compute_dtype)
 
 
-def build_pretrain_stage_model(rank: int, local_gpu: int, config: PretrainConfig):
+def build_pretrain_stage_model(rank: int, local_gpu: int, config: PretrainConfig, device: "torch.device | None" = None):
     """Returns (model, stage_layers, embed_tokens, norm, rotary_emb_or_None,
     lm_head, hidden_size, trainable_params). Unlike finetune.py's
     build_stage_model, there is no peft wrapper and no device_map -
@@ -193,7 +193,8 @@ def build_pretrain_stage_model(rank: int, local_gpu: int, config: PretrainConfig
     )
     model = AutoModelForCausalLM.from_config(model_config, torch_dtype=config.torch_dtype, attn_implementation=config.attn_implementation)
 
-    device = torch.device(f"cuda:{local_gpu}")
+    if device is None:
+        device = torch.device(f"cuda:{local_gpu}")
     is_first = rank == 0
     is_last = rank == config.world_size - 1
     my_range = stage_range(rank, config)
@@ -278,12 +279,12 @@ def build_pretrain_dataset(tokenizer, config: PretrainConfig) -> torch.Tensor:
 
 
 def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig, job_id: str = "pretrain_pipeline") -> list[float]:
-    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint
+    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint, resolve_device, mark_step
 
     set_seed(config.seed)
 
-    local_gpu = rank % torch.cuda.device_count()
-    device = torch.device(f"cuda:{local_gpu}")
+    device = resolve_device(rank)
+    local_gpu = device.index if device.type == "cuda" else 0
     is_first = rank == 0
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
@@ -299,7 +300,7 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
 
     model, stage_layers, embed, norm, rotary, lm_head, hidden_size, trainable, tokenizer = build_pretrain_stage_model(
-        rank, local_gpu, config
+        rank, local_gpu, config, device=device
     )
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
@@ -376,6 +377,7 @@ def run_pretrain_training(rank: int, signaling_url: str, config: PretrainConfig,
                 dist.send(hidden.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag)
 
             optimizer.step()
+            mark_step(device)
             if step_counter <= 3 or step_counter % config.log_every == 0:
                 msg = f"[rank {rank}] step {step_counter}/{total_steps}"
                 if is_last:

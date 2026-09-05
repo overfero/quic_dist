@@ -1,0 +1,28 @@
+# TPU smoke test: genuine full-parameter fine-tuning (full_finetune:
+# true), no LoRA adapter at all - requires quantization: "none" (see
+# PipelineConfig.full_finetune's own docstring: no gradient path exists
+# through a frozen quantized base with no adapter, and quantization is
+# CUDA-only/bitsandbytes anyway - doubly required here on TPU). Same
+# tiny-run shape as tpu_qwen25_0.5b_lora.yaml - validates the TPU
+# compute path, not throughput.
+#
+# Run: python3 pipeline_finetune_rank.py configs/tpu_qwen25_0.5b_full_finetune.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+full_finetune: true
+quantization: "none"
+compute_dtype: bfloat16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 16
+text_field: text
+
+seq_len: 64
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 1

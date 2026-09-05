@@ -27,6 +27,82 @@ import numpy as np
 import torch
 
 
+def _tpu_chip_count() -> int:
+    """Total local TPU chips on this host, from TPU_CHIPS_PER_HOST_BOUNDS
+    (e.g. "2,4,1" on a v5e-8 -> 8). Falls back to 8 (this project's only
+    validated TPU shape so far) if the env var isn't set - see
+    resolve_device()'s docstring for where that var comes from."""
+    bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS")
+    if not bounds:
+        return 8
+    dims = [int(x) for x in bounds.split(",")]
+    n = 1
+    for d in dims:
+        n *= d
+    return n
+
+
+def resolve_device(rank: int, local_index: int | None = None) -> torch.device:
+    """Picks this rank's real accelerator device: TPU > CUDA > CPU,
+    mirroring the old hardcoded `torch.device(f"cuda:{rank %
+    torch.cuda.device_count()}")` pattern every *_pipeline_rank.py
+    caller used, but for whichever backend is actually present.
+
+    TPU (PJRT_DEVICE=TPU in the environment - the standard Kaggle/GCE
+    TPU VM setup): each quic_dist rank is a genuinely separate OS
+    process (unlike torch_xla's own xmp.spawn(), which coordinates
+    sibling processes through one parent). Confirmed via a direct
+    two-process test that the PJRT TPU runtime is exclusive per host by
+    default - a second process's own device init hits a real `Device or
+    resource busy` on /dev/vfio and aborts. TPU_VISIBLE_CHIPS (which
+    physical chip this process may see) plus TPU_CHIPS_PER_PROCESS_BOUNDS/
+    TPU_PROCESS_BOUNDS=1,1,1 (this process owns exactly one chip) fixes
+    that - confirmed via the same test running both processes
+    concurrently without conflict once these were set. Set via
+    `os.environ.setdefault` (not unconditional) so a caller that already
+    exports these itself - e.g. a real multi-host TPU pod launcher -
+    isn't overridden. Must happen before `torch_xla` first touches the
+    runtime, which is why this function imports it lazily rather than at
+    module scope.
+
+    CUDA: unchanged behavior - `cuda:{local_index}`.
+
+    CPU: last resort, e.g. local dev/test without an accelerator."""
+    if os.environ.get("PJRT_DEVICE", "").upper() == "TPU":
+        if local_index is None:
+            local_index = rank % _tpu_chip_count()
+        os.environ.setdefault("TPU_VISIBLE_CHIPS", str(local_index))
+        os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", "1,1,1")
+        os.environ.setdefault("TPU_PROCESS_BOUNDS", "1,1,1")
+        import torch_xla.core.xla_model as xm
+
+        return xm.xla_device()
+    if torch.cuda.is_available():
+        if local_index is None:
+            local_index = rank % torch.cuda.device_count()
+        return torch.device(f"cuda:{local_index}")
+    return torch.device("cpu")
+
+
+def mark_step(device: torch.device) -> None:
+    """No-op on CUDA/CPU. On TPU, torch_xla builds a lazy graph that
+    only actually runs when something forces it - a host read
+    (`.item()`/`.cpu()`) or an explicit mark. This project's pipeline
+    loop already forces plenty of syncs itself (the last stage's
+    `loss.item()` every step, every non-last rank's `.cpu()` activation/
+    gradient send every step), so training is CORRECT without this -
+    but leaving each step's graph to be closed off implicitly by
+    whichever host read happens to come along, rather than as a real
+    step boundary, was measurably slower in this project's own
+    validation run (~2x) - so call this once per step, right after
+    `optimizer.step()`, for real amortized compile/execute batching
+    instead of relying on that side effect."""
+    if device.type == "xla":
+        import torch_xla
+
+        torch_xla.sync()
+
+
 def set_seed(seed: int) -> None:
     """Seeds every RNG this project's training loops actually draw
     from. Call once, early, per rank - every rank uses the SAME seed

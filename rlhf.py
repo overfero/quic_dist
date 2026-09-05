@@ -132,14 +132,16 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
               # crash seen in this repo (see finetune.py's history) -
               # nothing to check statically, just documenting the known
               # failure mode here so it's not re-discovered per mode.
-    local_gpu = rank % torch.cuda.device_count()
-    device = torch.device(f"cuda:{local_gpu}")
+    from quic_dist.training_utils import resolve_device
+
+    device = resolve_device(rank)
+    local_gpu = device.index if device.type == "cuda" else 0
     quic_dist.init_process_group(
         signaling_url=signaling_url, rank=rank, world_size=config.world_size, job_id=job_id,
         timeout=timedelta(seconds=config.connect_timeout_s),
     )
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
-    peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config)
+    peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config, device=device)
     return local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size
 
 
@@ -937,7 +939,7 @@ def run_prm_training(rank: int, signaling_url: str, config: PRMConfig, job_id: s
     return losses
 
 
-def load_reward_model(rank: int, local_gpu: int, rm_config, checkpoint_dir: str) -> "LoadedRewardModel":
+def load_reward_model(rank: int, local_gpu: int, rm_config, checkpoint_dir: str, device: "torch.device | None" = None) -> "LoadedRewardModel":
     """Rebuilds this rank's slice of a previously-trained reward model
     (an ORM from run_rm_training, or a PRM from run_prm_training used
     ORM-style via pipeline_score - see LoadedRewardModel) for use as a
@@ -958,7 +960,7 @@ def load_reward_model(rank: int, local_gpu: int, rm_config, checkpoint_dir: str)
     from peft import PeftModel
 
     rank_dir = Path(checkpoint_dir) / f"rank{rank}"
-    peft_model, _, _, _, _, _, hidden_size = build_stage_model(rank, local_gpu, rm_config)
+    peft_model, _, _, _, _, _, hidden_size = build_stage_model(rank, local_gpu, rm_config, device=device)
     # build_stage_model always attaches a FRESH (randomly initialized)
     # LoRA adapter - discard it and load the ACTUAL trained one from
     # disk instead. The quantized base weights underneath are identical
@@ -977,11 +979,18 @@ def load_reward_model(rank: int, local_gpu: int, rm_config, checkpoint_dir: str)
     norm = resolve_attr(peft_model.base_model.model, rm_config.norm_attr)
     rotary = resolve_attr(peft_model.base_model.model, rm_config.rotary_attr) if rm_config.rotary_attr else None
 
+    if device is None:
+        device = torch.device(f"cuda:{local_gpu}")
     reward_head = None
     head_path = rank_dir / "reward_head.pt"
     if head_path.exists():
-        reward_head = nn.Linear(hidden_size, 1).to(device=f"cuda:{local_gpu}", dtype=torch.float32)
-        reward_head.load_state_dict(torch.load(head_path, map_location=f"cuda:{local_gpu}"))
+        reward_head = nn.Linear(hidden_size, 1).to(device=device, dtype=torch.float32)
+        # map_location=device would need torch_xla's own serialization
+        # remap on TPU (untested here) - loading to CPU first and
+        # letting load_state_dict copy into the already-placed module's
+        # parameters (which keep their own device) works on every
+        # backend uniformly.
+        reward_head.load_state_dict(torch.load(head_path, map_location="cpu"))
         reward_head.eval()
         for p in reward_head.parameters():
             p.requires_grad_(False)

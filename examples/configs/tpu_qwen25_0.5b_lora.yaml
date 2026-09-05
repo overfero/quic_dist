@@ -1,0 +1,32 @@
+# TPU smoke test: real LoRA (no bitsandbytes - it's CUDA-only, so
+# quantization must be "none" on TPU/XLA; see finetune.build_stage_model's
+# device guard). Same model/topology as qwen25_0.5b_lora.yaml, just with
+# quantization off and bfloat16 (TPU's native/fast dtype) instead of
+# fp16. Kept deliberately tiny (few examples, short seq_len, 1 epoch) -
+# this validates the TPU compute path end to end, not throughput.
+#
+# Run (one process per rank, each pinned to its own TPU core via
+# training_utils.resolve_device - see that function's docstring):
+#   python3 pipeline_finetune_rank.py configs/tpu_qwen25_0.5b_lora.yaml <rank> <signaling_url>
+
+model_path: Qwen/Qwen2.5-0.5B
+world_size: 2
+num_layers: 24
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"
+compute_dtype: bfloat16
+
+dataset_name: tatsu-lab/alpaca
+dataset_split: train
+num_examples: 16
+text_field: text
+
+seq_len: 64
+batch: 2
+epochs: 1
+lr: 0.0001
+log_every: 1

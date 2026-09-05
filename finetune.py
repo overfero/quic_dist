@@ -379,8 +379,25 @@ def build_device_map(rank: int, local_gpu: int, config: PipelineConfig) -> dict:
     return device_map
 
 
-def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
-    """Returns (peft_model, stage_layers, embed_tokens, norm, rotary_emb_or_None, lm_head, hidden_size)."""
+def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig, device: "torch.device | None" = None):
+    """Returns (peft_model, stage_layers, embed_tokens, norm, rotary_emb_or_None, lm_head, hidden_size).
+
+    `device` defaults to `cuda:{local_gpu}` (unchanged behavior) when
+    omitted - pass it explicitly for any non-CUDA backend (e.g. a TPU
+    `xla:N` device from training_utils.resolve_device()). Quantization
+    ("4bit"/"8bit", i.e. bitsandbytes/QLoRA) is CUDA-only by construction
+    - bitsandbytes has no TPU/XLA kernel - so it's rejected up front on
+    any non-CUDA device rather than failing deep inside
+    AutoModelForCausalLM.from_pretrained() with a confusing import/
+    kernel error."""
+    if device is None:
+        device = torch.device(f"cuda:{local_gpu}")
+    if config.quantization != "none" and device.type != "cuda":
+        raise ValueError(
+            f"build_stage_model: quantization={config.quantization!r} requires a CUDA device "
+            f"(bitsandbytes has no TPU/XLA support) - got {device}. Use quantization='none' "
+            f"(plain LoRA or full_finetune) on TPU."
+        )
     if config.patch_torchao_check:
         import peft.tuners.lora.torchao as torchao_mod
 
@@ -427,7 +444,7 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
     else:
         model = AutoModelForCausalLM.from_pretrained(
             config.model_path, dtype=config.torch_dtype, attn_implementation=config.attn_implementation,
-        ).to(f"cuda:{local_gpu}")
+        ).to(device)
 
     if config.full_finetune:
         if config.quantization != "none":
@@ -505,7 +522,8 @@ def build_stage_model(rank: int, local_gpu: int, config: PipelineConfig):
             lm_head = None
         layers = resolve_attr(base, config.layers_attr)
         stage_layers = layers
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     n_trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     print(f"[rank {rank}] trainable params: {n_trainable}, layers {list(my_range)}", flush=True)
@@ -779,14 +797,13 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     (log_path)."""
     from quic_dist.training_utils import (
         set_seed, ExperimentLogger, perplexity, CheckpointState,
-        save_checkpoint, load_checkpoint,
+        save_checkpoint, load_checkpoint, resolve_device, mark_step,
     )
 
     set_seed(config.seed)
 
-    if local_gpu is None:
-        local_gpu = rank % torch.cuda.device_count()
-    device = torch.device(f"cuda:{local_gpu}")
+    device = resolve_device(rank, local_gpu)
+    local_gpu = device.index if device.type == "cuda" else 0
     is_first = rank == 0
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
@@ -807,7 +824,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
     )
     print(f"[rank {rank}] process group ready (local GPU {local_gpu})", flush=True)
 
-    peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config)
+    peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = build_stage_model(rank, local_gpu, config, device=device)
     if config.gradient_checkpointing:
         peft_model.enable_input_require_grads()
 
@@ -1017,6 +1034,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
                     batches, response_masks, config.gradient_checkpointing,
                 )
                 optimizer.step()
+                mark_step(device)
                 if is_last:
                     losses.extend(window_losses)
 
@@ -1066,6 +1084,7 @@ def run_pipeline_training(rank: int, signaling_url: str, config: PipelineConfig,
 
                 if is_accum_end:
                     optimizer.step()
+                    mark_step(device)
 
                 _post_window_bookkeeping(step_counter, epoch, b)
 

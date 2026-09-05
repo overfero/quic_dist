@@ -218,13 +218,13 @@ def run_distill_training(rank: int, signaling_url: str, config: DistillConfig, j
     is always 2 for this module - point-to-point teacher->student, not a
     pipeline. Returns the student's per-step total-loss list (empty on
     rank 0)."""
-    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint
+    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint, resolve_device, mark_step
 
     set_seed(config.seed)
 
     is_teacher = rank == 0
-    local_gpu = rank % torch.cuda.device_count()
-    device = torch.device(f"cuda:{local_gpu}")
+    device = resolve_device(rank)
+    local_gpu = device.index if device.type == "cuda" else 0
 
     logger = ExperimentLogger(config.log_path, rank)
     logger.log_config(config)

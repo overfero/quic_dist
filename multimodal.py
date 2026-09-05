@@ -341,7 +341,7 @@ def build_vlm_sft_dataset(processor, tokenizer, config: MultimodalConfig) -> lis
 
 def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalConfig,
                              job_id: str = "multimodal_pipeline") -> list[float]:
-    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint
+    from quic_dist.training_utils import set_seed, ExperimentLogger, CheckpointState, save_checkpoint, load_checkpoint, resolve_device, mark_step
 
     set_seed(config.seed)
 
@@ -355,8 +355,8 @@ def run_multimodal_training(rank: int, signaling_url: str, config: MultimodalCon
     logger = ExperimentLogger(config.log_path, rank)
     logger.log_config(config)
 
-    local_gpu = rank % torch.cuda.device_count()
-    device = torch.device(f"cuda:{local_gpu}")
+    device = resolve_device(rank)
+    local_gpu = device.index if device.type == "cuda" else 0
     is_first = rank == 0
     is_last = rank == config.world_size - 1
     prev_rank = rank - 1 if rank > 0 else None
