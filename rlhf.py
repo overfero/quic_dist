@@ -1140,6 +1140,16 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
     generated_chunks = []  # rank0 and is_last only; list of (G,) tensors, one per new token
     cur_token = None       # rank0 only: the (G,1) token to embed this call
 
+    # Real per-token progress visibility - this loop was previously
+    # totally silent for its whole duration (max_new_tokens calls, each
+    # a full round trip through every layer), which made a genuinely
+    # slow generation (a large model + many rollouts under TP)
+    # indistinguishable from a hang with nothing to look at. rank 0
+    # only (avoids duplicate prints when is_first/is_last are different
+    # real ranks); every call for the first few (compile-heavy) calls,
+    # then every 16 after that.
+    gen_t_start = time.monotonic()
+
     with torch.no_grad():
         for call_idx in range(max_new_tokens):
             is_prefill = call_idx == 0
@@ -1188,15 +1198,34 @@ def pipeline_generate(rank, config, stage_layers, embed, norm, rotary, lm_head, 
                 logits = lm_head(norm(last_hidden).to(lm_head.weight.dtype))[:, -1, :]
                 next_token = _sample_token(logits, temperature)  # (G,)
                 generated_chunks.append(next_token.cpu())
-                dist.send(next_token.cpu().unsqueeze(1), dst=0, tag=tag_base)
+                if is_first:
+                    # world_size==1: this rank is BOTH first and last -
+                    # carry the token directly rather than a real
+                    # network round trip to itself (dst==rank, a real
+                    # crash confirmed via a direct TPU tensor-parallel-
+                    # only run: "Invalid destination rank" -
+                    # ProcessGroupQUIC/torch.distributed both reject a
+                    # send/recv where dst/src equals the caller's own
+                    # rank - every prior GRPO/PPO validation run in
+                    # this repo used world_size>=2, so this path was
+                    # never exercised before).
+                    cur_token = next_token.cpu().unsqueeze(1)
+                else:
+                    dist.send(next_token.cpu().unsqueeze(1), dst=0, tag=tag_base)
             else:
                 dist.send(out.to(config.torch_dtype).cpu(), dst=next_rank, tag=tag_base)
 
-            if is_first:
+            if is_first and not is_last:
                 recv_tok = torch.zeros(G, 1, dtype=torch.long)
                 dist.recv(recv_tok, src=world_size - 1, tag=tag_base)
                 cur_token = recv_tok
                 generated_chunks.append(recv_tok.squeeze(1))
+
+            mark_step(device)
+
+            if rank == 0 and (call_idx < 3 or (call_idx + 1) % 16 == 0 or call_idx == max_new_tokens - 1):
+                print(f"[rank {rank}] pipeline_generate: token {call_idx + 1}/{max_new_tokens} "
+                      f"elapsed={time.monotonic() - gen_t_start:.1f}s", flush=True)
 
     if is_first or is_last:
         return torch.stack(generated_chunks, dim=1)  # (G, max_new_tokens)
@@ -1335,6 +1364,17 @@ class GRPOConfig(RLHFModelConfig):
     # windowing/flush semantics. 1 (default) = a step() after every
     # micro-batch, this class's existing behavior, completely unchanged.
     gradient_accumulation_steps: int = 1
+
+    # Real math-reasoning fields - only read by run_grpo_math_training
+    # (see its own docstring), completely unused by run_grpo_training/
+    # run_grpo_training_from_rollouts, so their existing behavior/config
+    # files are entirely unaffected by these existing.
+    dataset_config: str | None = None   # HF load_dataset's second positional arg - GSM8K needs "main"
+    answer_field: str = "answer"        # ground-truth field for gsm8k_correctness_reward
+    warmup_steps: int = 0               # linear LR warmup, then cosine decay - 0 = no warmup (LR ramps
+                                         # straight into the cosine schedule from step 0)
+    grad_clip: float = 0.0              # global-norm gradient clipping - 0 = disabled
+    weight_decay: float = 0.0
 
     @classmethod
     def from_file(cls, path: str) -> "GRPOConfig":
@@ -1637,6 +1677,229 @@ def run_grpo_training(rank: int, signaling_url: str, config: GRPOConfig, job_id:
     return losses
 
 
+def _extract_final_number(text: str) -> str | None:
+    """GSM8K's own answer format ends every reference solution with
+    `#### <number>` - extracted here the same way for both the ground
+    truth AND the model's generated text. Falls back to the last bare
+    number in the text when no `####` marker is present (a real,
+    common case for the generated side - the policy doesn't always
+    learn to emit the exact marker, especially early in training;
+    treating that as simply wrong, rather than crashing or masking it
+    out, is what makes 0.0 reward the correct/expected outcome for a
+    genuinely-unmarked answer rather than a bug)."""
+    import re
+
+    m = re.search(r"####\s*([\-0-9][0-9,]*\.?[0-9]*)", text)
+    if m:
+        return m.group(1).replace(",", "").strip()
+    nums = re.findall(r"[\-0-9][0-9,]*\.?[0-9]*", text.replace(",", ""))
+    return nums[-1] if nums else None
+
+
+def gsm8k_correctness_reward(generated_text: str, ground_truth_answer: str) -> float:
+    """Real answer-correctness reward for GSM8K-style math reasoning -
+    1.0 if the generated text's final number matches the reference
+    answer's, else 0.0. Deliberately NOT `default_reward_fn` (that
+    function's own docstring is explicit it's a lexical-diversity/
+    length stand-in, not a grader) - this is what an actual math-RL
+    recreation needs: ground truth comes from the DATASET, not the
+    model's own output, so this takes two arguments and is called
+    directly by `run_grpo_math_training` below rather than through the
+    single-argument `reward_fn(text) -> float` contract every other
+    RLHF mode in this file uses (that contract has no way to carry
+    per-prompt ground truth through to the reward call - see this
+    function's caller for why a new, parallel training loop was
+    written instead of reusing run_grpo_training unmodified)."""
+    gt = _extract_final_number(ground_truth_answer)
+    pred = _extract_final_number(generated_text)
+    if gt is None or pred is None:
+        return 0.0
+    try:
+        return 1.0 if abs(float(pred) - float(gt)) < 1e-4 else 0.0
+    except ValueError:
+        return 1.0 if pred == gt else 0.0
+
+
+def build_math_reasoning_prompts(tokenizer, config: GRPOConfig) -> list[tuple[torch.Tensor, str]]:
+    """Like build_grpo_prompts, but also carries each prompt's ground-
+    truth answer along (config.answer_field) - real, sourced from the
+    dataset, needed for gsm8k_correctness_reward. config.dataset_config
+    is the HF `load_dataset(name, config_name, split=...)` second
+    positional arg (GSM8K needs "main"; None for datasets that don't
+    take one - unlike build_grpo_prompts's dataset, which never needed
+    this)."""
+    from datasets import load_dataset
+
+    split = config.dataset_split if config.num_examples is None else f"{config.dataset_split}[:{config.num_examples}]"
+    if getattr(config, "dataset_config", None):
+        ds = load_dataset(config.dataset_name, config.dataset_config, split=split)
+    else:
+        ds = load_dataset(config.dataset_name, split=split)
+    out = []
+    for ex in ds:
+        ids = tokenizer(ex[config.prompt_field], truncation=True, max_length=config.max_prompt_len,
+                         add_special_tokens=True)["input_ids"]
+        out.append((torch.tensor([ids], dtype=torch.long), ex[config.answer_field]))
+    return out
+
+
+def run_grpo_math_training(rank: int, signaling_url: str, config: GRPOConfig, job_id: str = "grpo_math_pipeline",
+                            wandb_project: str | None = None, wandb_run_name: str | None = None) -> list[float]:
+    """Real math-reasoning GRPO recreation (GSM8K/MATH-style: sample
+    G completions per problem, score each by real numeric-answer
+    correctness against the dataset's own ground truth, group-relative
+    advantage, policy-gradient + optional KL update) - a genuinely
+    separate training loop from run_grpo_training rather than a
+    modification of it, for two real reasons: (1) reward_fn's single-
+    argument contract there has no way to carry per-prompt ground
+    truth through to the reward call (see gsm8k_correctness_reward's
+    docstring), and (2) this loop adds an LR schedule (cosine with
+    linear warmup) and gradient clipping - config-gated so a caller
+    who wants run_grpo_training's exact prior behavior (plain constant-
+    LR AdamW, no clipping) is completely unaffected by this function's
+    existence.
+
+    `wandb_project` (and optionally `wandb_run_name`) turns on real
+    Weights & Biases logging alongside the existing JSONL
+    ExperimentLogger - reads the API key from the `WANDB_API_KEY`
+    environment variable (never accepted as a parameter/config field,
+    so it can never end up serialized into a config file or a
+    checkpoint). None (default) = no wandb involved at all, matching
+    every other training entry point in this file."""
+    import math
+    from transformers import AutoTokenizer
+    from quic_dist.training_utils import mark_step
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    local_gpu, device, peft_model, stage_layers, embed, norm, rotary, lm_head, hidden_size = _init_rank(
+        rank, signaling_url, config, job_id
+    )
+    is_first = rank == 0
+    is_last = rank == config.world_size - 1
+    prev_rank = rank - 1 if rank > 0 else None
+    next_rank = rank + 1 if rank < config.world_size - 1 else None
+
+    use_wandb = wandb_project is not None and is_last
+    wb = None
+    if use_wandb:
+        import os
+        import wandb
+
+        api_key = os.environ.get("WANDB_API_KEY")
+        if not api_key:
+            raise ValueError("run_grpo_math_training: wandb_project given but WANDB_API_KEY is not set in the environment.")
+        wandb.login(key=api_key)
+        wb = wandb.init(project=wandb_project, name=wandb_run_name, config={
+            k: v for k, v in vars(config).items() if isinstance(v, (int, float, str, bool, type(None)))
+        })
+
+    dist.barrier()
+    print(f"[rank {rank}] all ranks finished loading, starting training", flush=True)
+
+    trainable = [p for p in peft_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=config.lr, weight_decay=getattr(config, "weight_decay", 0.0))
+
+    prompts = build_math_reasoning_prompts(tokenizer, config)
+    n_steps = len(prompts)
+    total_steps = n_steps * config.epochs
+    G = config.group_size
+
+    warmup_steps = getattr(config, "warmup_steps", 0)
+    grad_clip = getattr(config, "grad_clip", 0.0)
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / warmup_steps
+        if total_steps <= warmup_steps:
+            return 1.0
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    print(f"[rank {rank}] GRPO math-reasoning: {config.epochs} epochs x {n_steps} problems = {total_steps} steps, "
+          f"group_size={G}, max_new_tokens={config.max_new_tokens}, warmup_steps={warmup_steps}, "
+          f"grad_clip={grad_clip}", flush=True)
+
+    losses: list[float] = []
+    rewards_log: list[float] = []
+    accuracy_log: list[float] = []
+    t_start = time.monotonic()
+    step_counter = 0
+
+    for epoch in range(config.epochs):
+        for prompt_ids, gt_answer in prompts:
+            _step_barrier(signaling_url, config, f"grpo_math_{step_counter + 1}", job_id=job_id)
+            step_counter += 1
+            tag_gen = (step_counter % 4) * 3
+            tag_ref = tag_gen + 1
+            tag_policy = tag_gen + 2
+
+            peft_model.eval()
+            generated = pipeline_generate(
+                rank, config, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
+                is_first, is_last, prev_rank, next_rank, tag_gen,
+                group_size=G, max_new_tokens=config.max_new_tokens, temperature=config.temperature,
+                prompt_ids=prompt_ids if is_first else None,
+            )
+            peft_model.train()
+
+            rewards = None
+            if is_last:
+                texts = [tokenizer.decode(generated[g], skip_special_tokens=True) for g in range(G)]
+                rewards = torch.tensor([gsm8k_correctness_reward(t, gt_answer) for t in texts], dtype=torch.float32)
+
+            loss_value, reward_mean, kl_value = _grpo_update_from_rollout(
+                rank, config, peft_model, optimizer, stage_layers, embed, norm, rotary, lm_head, hidden_size, device,
+                is_first, is_last, prev_rank, next_rank, tag_ref, tag_policy,
+                prompt_ids, generated, rewards,
+            )
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+            scheduler.step()
+            mark_step(device)
+
+            if is_last:
+                losses.append(loss_value)
+                rewards_log.append(reward_mean)
+                accuracy_log.append(reward_mean)  # reward IS accuracy here (0/1 correctness) - see gsm8k_correctness_reward
+                if wb is not None:
+                    wb.log({
+                        "train/loss": loss_value, "train/reward_mean": reward_mean,
+                        "train/accuracy": reward_mean, "train/lr": scheduler.get_last_lr()[0],
+                        "train/kl": kl_value if kl_value is not None else 0.0,
+                    }, step=step_counter)
+
+            if step_counter <= 3 or step_counter % config.log_every == 0:
+                msg = f"[rank {rank}] step {step_counter}/{total_steps}"
+                if is_last:
+                    msg += (f" loss={losses[-1]:.4f} reward={rewards_log[-1]:.3f} "
+                            f"lr={scheduler.get_last_lr()[0]:.2e}")
+                print(msg, flush=True)
+
+        elapsed = time.monotonic() - t_start
+        if is_last and losses:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} loss={losses[-1]:.4f} "
+                  f"reward={rewards_log[-1]:.3f} elapsed={elapsed:.1f}s", flush=True)
+        else:
+            print(f"[rank {rank}] epoch {epoch}/{config.epochs} elapsed={elapsed:.1f}s", flush=True)
+
+    total_elapsed = time.monotonic() - t_start
+    print(f"[rank {rank}] GRPO math-reasoning training DONE in {total_elapsed:.1f}s ({total_steps} steps)", flush=True)
+    if is_last and rewards_log:
+        avg_acc = sum(accuracy_log) / len(accuracy_log)
+        print(f"[rank {rank}] accuracy avg over run: {avg_acc:.4f}", flush=True)
+        if wb is not None:
+            wb.summary["final/accuracy_avg"] = avg_acc
+            wb.finish()
+
+    _teardown(rank)
+    return losses
+
+
 @dataclass
 class RolloutBatch:
     """One externally-generated GRPO rollout, ready to train on directly
@@ -1649,6 +1912,51 @@ class RolloutBatch:
     prompt_ids: torch.Tensor  # (1, prompt_len), long, CPU
     generated: torch.Tensor   # (G, N), long, CPU - G sampled completions, same length N
     rewards: torch.Tensor     # (G,), float32 - already scored (e.g. by quic-rl's RewardBackend)
+
+
+def load_rollouts_from_vllm_json(path: str, pad_token_id: int) -> list[RolloutBatch]:
+    """Real `rollout_source` for run_grpo_training_from_rollouts, reading
+    the JSON file examples/vllm_generate_rollout.py writes (real vLLM-TPU
+    batched generation, run in vLLM's own venv/process, sequentially
+    BEFORE this one - see that script's own module docstring for why
+    sequential handoff rather than concurrent chip-sharing). Scores each
+    completion with gsm8k_correctness_reward using the SAME ground-truth
+    answer saved alongside the prompt, real per-rollout correctness, not
+    a placeholder.
+
+    Every rank calls this identically (same file, same result) - matches
+    run_grpo_training_from_rollouts's own requirement that every rank's
+    rollout_source be an equivalent sequence, since this function never
+    broadcasts anything itself.
+
+    vLLM's own completions are naturally RAGGED (a rollout can hit EOS
+    before max_new_tokens) - padded here to the LONGEST completion in
+    each group with pad_token_id so `generated` is a real rectangular
+    (G, N) tensor, the shape `_grpo_update_from_rollout` requires. The
+    padded positions never enter the reward computation (that reads the
+    original text, saved unpadded) and contribute a negligible,
+    consistent constant to the loss the same way `finetune.py`'s own
+    right-padded batches already do elsewhere in this repo."""
+    import json
+
+    with open(path) as f:
+        records = json.load(f)
+
+    batches = []
+    for rec in records:
+        prompt_ids = torch.tensor([rec["prompt_ids"]], dtype=torch.long)
+        completions = rec["completions"]
+        max_len = max(len(c["token_ids"]) for c in completions)
+        gen_rows = []
+        rewards = []
+        for c in completions:
+            ids = c["token_ids"]
+            padded = ids + [pad_token_id] * (max_len - len(ids))
+            gen_rows.append(padded)
+            rewards.append(gsm8k_correctness_reward(c["text"], rec["ground_truth_answer"]))
+        generated = torch.tensor(gen_rows, dtype=torch.long)
+        batches.append(RolloutBatch(prompt_ids=prompt_ids, generated=generated, rewards=torch.tensor(rewards, dtype=torch.float32)))
+    return batches
 
 
 def run_grpo_training_from_rollouts(

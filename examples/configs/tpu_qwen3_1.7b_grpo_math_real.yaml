@@ -1,0 +1,63 @@
+# Recreating jaygala24/Qwen3-1.7B-GRPO-math-reasoning
+# (https://huggingface.co/jaygala24/Qwen3-1.7B-GRPO-math-reasoning) at a
+# real, runnable scale on a single shared TPU v5e-8 - matches the model
+# card's hyperparameter VALUES (kl_coef=0.0, lr=1e-6, grad_clip=0.3,
+# weight_decay=0.01, group_size=16, GSM8K) but keeps step count small
+# (num_examples=4) rather than the original's max_steps=1500 - that
+# needs a real multi-GPU/TPU cluster running for hours, not a
+# same-day validation. See rlhf.py's run_grpo_math_training docstring
+# for the epsilon-clip (0.02) gap this doesn't attempt (a real no-op
+# here anyway - no inner-epoch rollout reuse means the importance
+# ratio is always exactly 1.0, same as quic_dist's own GRPO, so
+# clip(1.0, 0.98, 1.02) changes nothing regardless).
+#
+# tensor_parallel_size: 1 - deliberately NOT sharded. Qwen3-1.7B (~3.4GB
+# bf16) fits trivially on ONE TPU v5e chip (16GB HBM); 8-way TP was
+# real overkill that mostly added cross-chip coordination overhead
+# with no benefit at this model size (measured directly: dropping from
+# TP=8 to TP=1 only modestly reduced per-token generation cost - the
+# REAL fix that took generation from ~5-7s/token to ~0.09s/token, a
+# ~50-70x speedup, was adding mark_step()/torch_xla.sync() calls inside
+# pipeline_generate's per-token loop, which this repo's generation path
+# never had before this session - see training_utils.mark_step's own
+# docstring for the same class of fix already applied to every training
+# loop's optimizer.step()).
+#
+# Run: python3 grpo_math_reasoning_rank.py configs/tpu_qwen3_1.7b_grpo_math_real.yaml \
+#   0 http://localhost:8000 grpo_math_real1 quic-dist-grpo-math qwen3-1.7b-tpu-real
+
+model_path: Qwen/Qwen3-1.7B
+world_size: 1
+num_layers: 28
+tensor_parallel_size: 1
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"
+compute_dtype: bfloat16
+
+# Real GSM8K, real ground-truth-answer reward (gsm8k_correctness_reward)
+dataset_name: openai/gsm8k
+dataset_config: main
+dataset_split: train
+answer_field: answer
+prompt_field: question
+num_examples: 4          # 4 steps at this scale - real but short validation run
+max_prompt_len: 512
+max_new_tokens: 2048      # enough room for a real GSM8K reasoning chain + final answer -
+                          # at ~0.09-0.1s/token this is ~3-4 min of generation per step
+
+group_size: 16            # matches the original's "rollouts per problem" exactly
+temperature: 1.0
+kl_coef: 0.0               # matches the original exactly ("GRPO without KL penalty")
+epochs: 1
+
+lr: 0.000001               # matches the original exactly (1e-06)
+warmup_steps: 0            # moot at 4 steps; the original's 25 applies once step count is scaled up
+grad_clip: 0.3              # matches the original exactly
+weight_decay: 0.01          # matches the original exactly
+
+log_every: 1
+connect_timeout_s: 900

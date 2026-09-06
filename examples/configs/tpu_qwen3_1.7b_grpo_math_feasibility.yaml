@@ -1,0 +1,56 @@
+# TPU feasibility test recreating jaygala24/Qwen3-1.7B-GRPO-math-reasoning
+# (https://huggingface.co/jaygala24/Qwen3-1.7B-GRPO-math-reasoning) -
+# hyperparameter RATIOS/structure match that model card (kl_coef=0.0,
+# lr=1e-6, cosine schedule, warmup, grad_clip=0.3, weight_decay=0.01,
+# group_size=16, GSM8K), but scale (steps/seq_len) is drastically cut
+# down for a first feasibility check on a real, first-time-tried model
+# size (Qwen3-1.7B) on a single shared TPU v5e-8, rather than the
+# original's max_steps=1500/seq_len=8192/effective_batch=256, which
+# needs a real multi-GPU/TPU cluster running for hours. See rlhf.py's
+# run_grpo_math_training docstring for the epsilon-clip (0.02) gap this
+# doesn't attempt (functionally a no-op here anyway - no inner-epoch
+# rollout reuse means the importance ratio is always exactly 1.0,
+# same as quic_dist's own GRPO, so clip(1.0, 0.98, 1.02) changes
+# nothing regardless).
+#
+# Run (2 steps, just to prove Qwen3-1.7B + TP=8 + generation fits and
+# runs at all before committing to a longer run):
+#   WANDB_API_KEY=... python3 grpo_math_reasoning_rank.py \
+#     configs/tpu_qwen3_1.7b_grpo_math_feasibility.yaml 0 http://localhost:8000 \
+#     grpo_math_feas1 quic-dist-grpo-math qwen3-1.7b-tpu-feasibility
+
+model_path: Qwen/Qwen3-1.7B
+world_size: 1
+num_layers: 28
+tensor_parallel_size: 8
+
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+quantization: "none"
+compute_dtype: bfloat16
+
+# Real GSM8K, real ground-truth-answer reward (gsm8k_correctness_reward)
+dataset_name: openai/gsm8k
+dataset_config: main
+dataset_split: train
+answer_field: answer
+prompt_field: question
+num_examples: 2          # 2 steps - feasibility check only
+max_prompt_len: 128
+max_new_tokens: 64       # first pass: small, just to get a fast correctness/timing signal
+                          # before scaling toward the original's 8192 - see module comment above
+
+group_size: 16           # matches the original's "rollouts per problem" exactly
+temperature: 1.0
+kl_coef: 0.0             # matches the original exactly ("GRPO without KL penalty")
+epochs: 1
+
+lr: 0.000001             # matches the original exactly (1e-06)
+warmup_steps: 0          # moot at 2 steps; keep the original's 25 once step count is scaled up
+grad_clip: 0.3           # matches the original exactly
+weight_decay: 0.01       # matches the original exactly
+
+log_every: 1
+connect_timeout_s: 900
