@@ -1546,6 +1546,10 @@ def _grpo_update_from_rollout(
         dist.send(hidden_in.grad.detach().to(config.torch_dtype).cpu(), dst=prev_rank, tag=tag_policy)
 
     if do_step:
+        grad_clip = getattr(config, "grad_clip", 0.0)
+        if grad_clip > 0:
+            trainable = [p for p in peft_model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
         optimizer.step()
         mark_step(device)
     return loss_value, (reward_mean if is_last else None), kl_value
@@ -2071,7 +2075,7 @@ def run_grpo_training_from_rollouts(
     print(f"[rank {rank}] all ranks finished loading, starting training (external rollouts)", flush=True)
 
     trainable = [p for p in peft_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+    optimizer = torch.optim.AdamW(trainable, lr=config.lr, weight_decay=getattr(config, "weight_decay", 0.0))
 
     losses: list[float] = []
     rewards_log: list[float] = []
