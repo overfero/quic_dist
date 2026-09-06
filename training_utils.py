@@ -42,7 +42,41 @@ def _tpu_chip_count() -> int:
     return n
 
 
-def resolve_device(rank: int, local_index: int | None = None, tensor_parallel_size: int = 1) -> torch.device:
+def _factor_chip_bounds(n: int) -> str:
+    """A valid `TPU_CHIPS_PER_PROCESS_BOUNDS` string for an n-chip
+    AXIS-ALIGNED RECTANGLE of this host's real physical topology
+    (TPU_CHIPS_PER_HOST_BOUNDS, e.g. "2,4,1" on a v5e-8 - a 2x4 grid).
+    Real bug this fixes: the original implementation always used the
+    flat `f"{n},1,1"` shape, which is only a valid rectangle when n <=
+    the physical x-dimension (2 here) - for any larger n (e.g. 6, or 8
+    for the whole host) that shape doesn't decompose the real topology
+    at all and crashes identically to the whole-host "8,1,1" bug this
+    module's own resolve_device docstring already documents. Confirmed
+    directly: n=6 as "2,3,1" (2 in x, 3 in y) lets a torch_xla process
+    and a concurrent JAX process each successfully claim their own
+    real, disjoint chip rectangle (e.g. chips [2,8) as "2,3,1" here,
+    chips [0,2) as "2,1,1" in a sibling process) - literal "N,1,1" for
+    N=6 does not.
+
+    Only 1/2/3/4/6/8 are real rectangle sizes on a 2x4 grid (7 is prime
+    and has no factor pair (a<=2, b<=4) - a real hardware constraint,
+    not a limitation of this function - see this module's own
+    docstring for the concrete reasoning)."""
+    bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS")
+    if bounds:
+        px, py = (int(x) for x in bounds.split(",")[:2])
+    else:
+        px, py = 2, 4  # this project's only validated TPU shape so far (v5e-8)
+    for a in range(min(px, n), 0, -1):
+        if n % a == 0 and (n // a) <= py:
+            return f"{a},{n // a},1"
+    return f"{n},1,1"  # no valid rectangle exists for this n - falls back to the old
+                        # (known-unsafe for n>px) shape rather than raising, so a genuinely
+                        # invalid n (e.g. 7) still gets a clear runtime error from libtpu
+                        # itself rather than an opaque one from this function
+
+
+def resolve_device(rank: int, local_index: int | None = None, tensor_parallel_size: int = 1, chip_offset: int = 0) -> torch.device:
     """Picks this rank's real accelerator device: TPU > CUDA > CPU,
     mirroring the old hardcoded `torch.device(f"cuda:{rank %
     torch.cuda.device_count()}")` pattern every *_pipeline_rank.py
@@ -83,11 +117,20 @@ def resolve_device(rank: int, local_index: int | None = None, tensor_parallel_si
     LIVE-VALIDATED TP shape so far) skips TPU_VISIBLE_CHIPS/*_BOUNDS
     entirely rather than setting an arbitrary "{tp_size},1,1" - see the
     real crash this works around in the code below. A STRICT-SUBSET
-    block (world_size>1 combined with tensor_parallel_size>1, i.e. PP+TP
-    together) still uses that same "{tp_size},1,1" factorization, which
-    is only a VALID decomposition of the host's real physical topology
-    (TPU_CHIPS_PER_HOST_BOUNDS) for some tensor_parallel_size values, not
-    all - that combined path is UNTESTED, unlike the whole-host case.
+    block now uses `_factor_chip_bounds()` (a real axis-aligned-rectangle
+    factorization of the host's physical topology, not the old flat
+    "{tp_size},1,1" shape - see that function's own docstring for the
+    real crash class it fixes) - confirmed directly: a torch_xla process
+    claiming a 6-chip block (chips [2,8), bounds "2,3,1") and a
+    concurrent JAX process claiming a disjoint 2-chip block (chips [0,2),
+    bounds "2,1,1") both succeed at the same time.
+
+    `chip_offset`: shifts the whole block by this many chips - e.g. a
+    caller that's dedicating chips [0, k) of the host to a DIFFERENT,
+    concurrently-running process (a same-host inference engine, say) and
+    wants quic_dist's own rank(s) confined to the REMAINING [k, total)
+    chips passes `chip_offset=k`. 0 (default) = unchanged behavior,
+    blocks start at chip 0 as before.
 
     CUDA: unchanged behavior - `cuda:{local_index}`.
 
@@ -95,11 +138,11 @@ def resolve_device(rank: int, local_index: int | None = None, tensor_parallel_si
     if os.environ.get("PJRT_DEVICE", "").upper() == "TPU":
         if tensor_parallel_size > 1:
             chip_count = _tpu_chip_count()
-            start = (local_index if local_index is not None else rank) * tensor_parallel_size
+            start = chip_offset + (local_index if local_index is not None else rank) * tensor_parallel_size
             if start + tensor_parallel_size > chip_count:
                 raise ValueError(
                     f"resolve_device: rank {rank} needs chips [{start}, {start + tensor_parallel_size}) "
-                    f"but only {chip_count} are available on this host - world_size * "
+                    f"but only {chip_count} are available on this host - chip_offset + world_size * "
                     f"tensor_parallel_size must fit within the host's total TPU chip count."
                 )
             # Only restrict TPU_VISIBLE_CHIPS/*_BOUNDS when this rank owns a
@@ -122,7 +165,7 @@ def resolve_device(rank: int, local_index: int | None = None, tensor_parallel_si
             if start != 0 or tensor_parallel_size != chip_count:
                 chips = ",".join(str(c) for c in range(start, start + tensor_parallel_size))
                 os.environ.setdefault("TPU_VISIBLE_CHIPS", chips)
-                os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", f"{tensor_parallel_size},1,1")
+                os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", _factor_chip_bounds(tensor_parallel_size))
                 os.environ.setdefault("TPU_PROCESS_BOUNDS", "1,1,1")
             import torch_xla.runtime as xr
 

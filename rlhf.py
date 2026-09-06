@@ -99,6 +99,17 @@ class RLHFModelConfig:
     # (DPO/GRPO/PPO/RM/PRM) shares, so this one field covers all of them.
     tensor_parallel_size: int = 1
 
+    # Shifts this run's TPU chip block by this many chips - see
+    # training_utils.resolve_device()'s own chip_offset docstring. 0
+    # (default) = unchanged behavior. Real use case: a same-host
+    # inference engine (e.g. vLLM-TPU serving rollouts for GRPO) pinned
+    # to chips [0, k) via ITS OWN chip-restriction mechanism, with this
+    # quic_dist run confined to the remaining [k, total) - confirmed
+    # directly that a torch_xla process and a concurrent JAX process can
+    # each claim their own disjoint chip rectangle this way (see
+    # _factor_chip_bounds's own docstring for the exact validated split).
+    tpu_chip_offset: int = 0
+
     # Same field/default as finetune.PipelineConfig's identical field -
     # required here too (not just documentation) since build_stage_model()
     # (finetune.py) is reused unmodified for every RLHF mode below via
@@ -146,7 +157,8 @@ def _init_rank(rank, signaling_url, config, job_id, dtype_check=True):
     from quic_dist.training_utils import resolve_device
 
     tp_size = getattr(config, "tensor_parallel_size", 1)
-    device = resolve_device(rank, tensor_parallel_size=tp_size)
+    chip_offset = getattr(config, "tpu_chip_offset", 0)
+    device = resolve_device(rank, tensor_parallel_size=tp_size, chip_offset=chip_offset)
     local_gpu = device.index if device.type == "cuda" else 0
     quic_dist.init_process_group(
         signaling_url=signaling_url, rank=rank, world_size=config.world_size, job_id=job_id,
