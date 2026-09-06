@@ -2070,8 +2070,18 @@ def run_grpo_training_from_rollouts(
     # See run_grpo_training's identical barrier for why: without this, a
     # fast-loading rank can start sending real tensors before a slow-
     # loading rank finishes, and the QUIC connection's own idle timeout
-    # closes it before the slow rank ever gets there.
-    dist.barrier()
+    # closes it before the slow rank ever gets there. Skipped entirely at
+    # world_size==1 (a real, single-machine full_finetune=True topology,
+    # not a hypothetical) - there is no second rank to race against, and
+    # a bare `dist.barrier()` there hit a real crash confirmed directly:
+    # `RuntimeError: Please register PrivateUse1HooksInterface...` from
+    # `torch._C._get_accelerator()` (called unconditionally inside
+    # torch's own barrier() to pick a device for the collective) - a
+    # real torch_xla/torch.distributed interaction never exercised
+    # before by this codebase's own single-rank validation runs, which
+    # were all LoRA rather than full_finetune=True.
+    if config.world_size > 1:
+        dist.barrier()
     print(f"[rank {rank}] all ranks finished loading, starting training (external rollouts)", flush=True)
 
     trainable = [p for p in peft_model.parameters() if p.requires_grad]
